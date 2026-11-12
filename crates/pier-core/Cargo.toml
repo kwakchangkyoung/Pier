@@ -1,0 +1,14 @@
+[package]
+name = "pier-core"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+opendal = { version = "0.59.5", default-features = false, features = [
+    "services-s3",
+    "http-transport-reqwest",
+    "executors-tokio",
+] }
+thiserror = "2.0.21"
+tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread"] }

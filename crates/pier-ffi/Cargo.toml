@@ -1,0 +1,14 @@
+[package]
+name = "pier-ffi"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+name = "pier_ffi"
+crate-type = ["staticlib", "cdylib", "lib"]
+
+[dependencies]
+pier-core = { path = "../pier-core" }
+tokio = { version = "1.54.1", features = ["rt-multi-thread"] }
+uniffi = { version = "0.32.2", features = ["tokio", "cli"] }
