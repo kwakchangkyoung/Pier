@@ -14,6 +14,24 @@ pub enum Error {
     Other(String),
 }
 
+impl From<std::io::Error> for Error {
+    fn from(err: std::io::Error) -> Self {
+        if is_network_io_kind(err.kind()) {
+            Error::Network(err.to_string())
+        } else if err.kind() == std::io::ErrorKind::NotFound {
+            Error::NotFound(err.to_string())
+        } else {
+            Error::Other(err.to_string())
+        }
+    }
+}
+
+impl From<rusqlite::Error> for Error {
+    fn from(err: rusqlite::Error) -> Self {
+        Error::Other(format!("cache: {err}"))
+    }
+}
+
 impl From<opendal::Error> for Error {
     fn from(err: opendal::Error) -> Self {
         let kind = err.kind();

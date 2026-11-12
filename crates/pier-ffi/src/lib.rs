@@ -1,9 +1,9 @@
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use pier_core::backend::opendal_s3::OpendalS3;
-use pier_core::backend::Entry as CoreEntry;
+use pier_core::backend::Backend;
 use pier_core::config::{ConnectionConfig, Provider};
+use pier_core::item::Item as CoreItem;
 use pier_core::Error as CoreError;
 
 uniffi::setup_scaffolding!();
@@ -61,23 +61,17 @@ impl From<CoreError> for PierError {
     }
 }
 
-impl From<CoreEntry> for PierEntry {
-    fn from(entry: CoreEntry) -> Self {
+impl From<CoreItem> for PierEntry {
+    fn from(item: CoreItem) -> Self {
         Self {
-            identifier: entry.key,
-            name: entry.name,
-            is_dir: entry.is_dir,
-            size: entry.size,
-            etag: entry.etag,
-            last_modified_ms: entry.last_modified.and_then(system_time_to_ms),
+            identifier: item.key,
+            name: item.name,
+            is_dir: item.is_dir,
+            size: item.size,
+            etag: item.etag,
+            last_modified_ms: item.last_modified_ms,
         }
     }
-}
-
-fn system_time_to_ms(time: SystemTime) -> Option<i64> {
-    time.duration_since(UNIX_EPOCH)
-        .ok()
-        .map(|d| d.as_millis() as i64)
 }
 
 #[derive(uniffi::Object)]
@@ -105,7 +99,9 @@ impl PierConnection {
     }
 
     pub async fn list_root(&self) -> Result<Vec<PierEntry>, PierError> {
-        let entries = self.backend.list_root().await?;
-        Ok(entries.into_iter().map(PierEntry::from).collect())
+        // 루트 바로 아래 전체를 한 번에 받아 PierEntry로 변환한다.
+        // (캐시 도입은 Phase 2에서 cacheDir 인자와 함께 추가)
+        let items = self.backend.list_folder("").await?;
+        Ok(items.into_iter().map(PierEntry::from).collect())
     }
 }

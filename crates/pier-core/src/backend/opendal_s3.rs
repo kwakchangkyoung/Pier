@@ -1,17 +1,23 @@
 use std::collections::HashSet;
+use std::path::Path;
 use std::time::SystemTime;
 
 use opendal::services::S3;
-use opendal::{EntryMode, Operator};
+use opendal::{EntryMode, Metadata, Operator};
+use tokio::io::AsyncWriteExt;
 
-use crate::backend::Entry;
+use crate::backend::Backend;
 use crate::config::ConnectionConfig;
 use crate::error::Error;
+use crate::item::Item;
 
-/// OpenDAL 기반 S3 백엔드. Phase 0에서는 루트 비재귀 목록만 제공한다.
+/// OpenDAL 기반 S3 백엔드.
 pub struct OpendalS3 {
     operator: Operator,
 }
+
+/// read_to_file에서 범위 읽기 한 번에 가져오는 크기.
+const READ_CHUNK_SIZE: u64 = 8 * 1024 * 1024;
 
 impl OpendalS3 {
     /// ConnectionConfig와 시크릿 키로 S3 Operator를 생성한다.
@@ -42,58 +48,109 @@ impl OpendalS3 {
         Ok(Self { operator })
     }
 
-    /// 루트 바로 아래 항목을 비재귀로 나열한다.
-    pub async fn list_root(&self) -> Result<Vec<Entry>, Error> {
-        let mut entries = Vec::new();
-        let mut seen = HashSet::new();
-        for opendal_entry in self.operator.list("/").await? {
-            let entry = to_entry(&opendal_entry);
-            // 루트 자기 자신(빈 key)과 폴더 마커/공통 접두사 중복을 제외한다.
-            if entry.key.is_empty() || !seen.insert(entry.key.clone()) {
+    /// read_to_file의 실제 구현. 실패하면 호출자가 부분 파일을 정리한다.
+    async fn read_to_file_inner(&self, key: &str, dest: &Path) -> Result<u64, Error> {
+        // 크기는 stat으로 먼저 얻는다(없는 키는 여기서 NotFound).
+        let meta = self.operator.stat(key).await?;
+        let size = meta.content_length();
+        let reader = self.operator.reader(key).await?;
+
+        let mut file = tokio::fs::File::create(dest).await?;
+        let mut written = 0u64;
+        let mut offset = 0u64;
+        // Phase 1은 순차 단일 스트림이다. 범위 읽기로 나눠 쓰되 한 번에
+        // 하나의 요청만 진행한다(병렬 범위 다운로드는 Phase 2).
+        while offset < size {
+            let end = (offset + READ_CHUNK_SIZE).min(size);
+            let buf = reader.read(offset..end).await?;
+            let bytes = buf.to_vec();
+            file.write_all(&bytes).await?;
+            written += bytes.len() as u64;
+            offset = end;
+        }
+        if written != size {
+            return Err(Error::Other(format!(
+                "크기 불일치: {key} — 기대 {size}B, 실제 {written}B"
+            )));
+        }
+        Ok(written)
+    }
+}
+
+impl Backend for OpendalS3 {
+    async fn list_folder(&self, prefix: &str) -> Result<Vec<Item>, Error> {
+        // 원격에서는 폴더 바로 아래 목록을 한 번에 전부 받는다.
+        // S3 응답 경계를 넘는 부분 읽기는 OpenDAL 목록 순서(CommonPrefixes
+        // 먼저, Contents 나중) 때문에 항목이 누락될 수 있어 쓰지 않는다(SPEC 4.3).
+        // 페이지 분할은 enumerate::Connection이 캐시에서 로컬로 한다.
+        let entries = self.operator.list_with(prefix).recursive(false).await?;
+
+        let mut seen = HashSet::with_capacity(entries.len());
+        let mut items = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let key = entry.path().trim_start_matches('/');
+            // 목록 prefix 자기 자신(폴더 마커 객체)은 제외한다.
+            if key.is_empty() || key == prefix {
                 continue;
             }
-            entries.push(entry);
+            // 폴더 마커 객체와 CommonPrefix가 같은 키로 둘 다 올 수 있다.
+            // 둘 다 같은 폴더이므로 첫 번째 것만 취한다(SPEC 3.2).
+            if !seen.insert(key.to_string()) {
+                continue;
+            }
+            items.push(to_item(key, entry.metadata()));
         }
-        Ok(entries)
+
+        // CommonPrefixes와 Contents를 따로 반환하므로 스트림 순서가
+        // 키 순서와 다를 수 있다. 반드시 정렬한다.
+        items.sort_by(|a, b| a.key.cmp(&b.key));
+        Ok(items)
+    }
+
+    async fn stat(&self, key: &str) -> Result<Item, Error> {
+        let meta = self.operator.stat(key).await?;
+        if meta.mode() == EntryMode::DIR || key.ends_with('/') {
+            Ok(Item::folder(key))
+        } else {
+            Ok(Item::file(
+                key,
+                meta.content_length(),
+                meta.etag().map(str::to_string),
+                last_modified_ms(&meta),
+            ))
+        }
+    }
+
+    async fn read_to_file(&self, key: &str, dest: &Path) -> Result<u64, Error> {
+        let result = self.read_to_file_inner(key, dest).await;
+        if result.is_err() {
+            // 부분 파일이 남지 않도록 삭제한다.
+            let _ = tokio::fs::remove_file(dest).await;
+        }
+        result
     }
 }
 
-fn to_entry(opendal_entry: &opendal::Entry) -> Entry {
-    let metadata = opendal_entry.metadata();
-    let is_dir = metadata.mode() == EntryMode::DIR;
-    let key = opendal_entry.path().trim_start_matches('/').to_string();
-    Entry {
-        name: display_name(&key),
-        key,
-        is_dir,
-        size: metadata.content_length(),
-        etag: metadata.etag().map(str::to_string),
-        last_modified: metadata.last_modified().map(SystemTime::from),
+/// opendal 엔트리의 경로·메타데이터를 Item으로 변환한다.
+fn to_item(key: &str, meta: &Metadata) -> Item {
+    if meta.mode() == EntryMode::DIR {
+        Item::folder(key)
+    } else {
+        Item::file(
+            key,
+            meta.content_length(),
+            meta.etag().map(str::to_string),
+            last_modified_ms(meta),
+        )
     }
 }
 
-/// key("photos/a.jpg", "photos/")에서 표시 이름(끝 '/' 제외 마지막 구간)을 뽑는다.
-fn display_name(key: &str) -> String {
-    let trimmed = key.trim_end_matches('/');
-    match trimmed.rsplit('/').next() {
-        Some(name) if !name.is_empty() => name.to_string(),
-        _ => trimmed.to_string(),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::display_name;
-
-    #[test]
-    fn display_name_cases() {
-        assert_eq!(display_name("a.jpg"), "a.jpg");
-        assert_eq!(display_name("photos/"), "photos");
-        assert_eq!(display_name("photos/a.jpg"), "a.jpg");
-        assert_eq!(
-            display_name("photos/2024/report final.pdf"),
-            "report final.pdf"
-        );
-        assert_eq!(display_name(""), "");
-    }
+/// opendal Timestamp를 Unix epoch 밀리초로 변환한다.
+fn last_modified_ms(meta: &Metadata) -> Option<i64> {
+    meta.last_modified().map(|ts| {
+        SystemTime::from(ts)
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or_default()
+    })
 }
