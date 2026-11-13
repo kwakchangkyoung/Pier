@@ -21,6 +21,19 @@ pub enum Error {
 }
 
 impl Error {
+    /// 로그용 범주 이름. 메시지에는 키·경로가 들어갈 수 있으므로
+    /// 로그에는 메시지 대신 이 범주만 남긴다 (SPEC 4.6).
+    pub fn category(&self) -> &'static str {
+        match self {
+            Self::Authentication(_) => "authentication",
+            Self::Network(_) => "network",
+            Self::NotFound(_) => "not_found",
+            Self::Conflict(_) => "conflict",
+            Self::Cancelled(_) => "cancelled",
+            Self::Other(_) => "other",
+        }
+    }
+
     /// opendal 에러를 분류하고 사용자·로그용 짧은 메시지를 만든다.
     ///
     /// `op`은 "stat", "list" 같은 작업 이름, `target`은 대상 키·접두사다.

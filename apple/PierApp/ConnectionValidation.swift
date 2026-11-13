@@ -7,6 +7,7 @@ enum ConnectionValidation {
     enum Field: Hashable {
         case displayName
         case endpoint
+        case accountId
         case region
         case bucket
         case accessKeyId
@@ -23,6 +24,7 @@ enum ConnectionValidation {
         copy.region = draft.region.trimmingCharacters(in: .whitespacesAndNewlines)
         copy.bucket = draft.bucket.trimmingCharacters(in: .whitespacesAndNewlines)
         copy.accessKeyId = draft.accessKeyId.trimmingCharacters(in: .whitespacesAndNewlines)
+        copy.accountId = trimOptional(draft.accountId)
         copy.endpoint = trimOptional(draft.endpoint)
         copy.prefix = trimOptional(draft.prefix)
         return copy
@@ -42,7 +44,15 @@ enum ConnectionValidation {
             result[.region] = "리전을 입력하세요. (예: us-east-1)"
         }
         validateBucket(draft.bucket, into: &result)
-        if draft.provider != .aws {
+        if let preset = draft.preset {
+            if preset.needsAccountId, draft.accountId == nil {
+                result[.accountId] = "계정 ID를 입력하세요."
+            }
+            if preset.needsEndpoint {
+                validateEndpoint(draft.endpoint, into: &result)
+            }
+        } else {
+            // 알 수 없는 프리셋 id는 사용자 지정처럼 엔드포인트가 필요하다.
             validateEndpoint(draft.endpoint, into: &result)
         }
         if draft.accessKeyId.isEmpty {

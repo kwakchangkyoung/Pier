@@ -14,6 +14,12 @@ enum NameAction: Identifiable {
     }
 }
 
+/// 정보 보기 시트에 넘길 객체 정보. sheet(item:)용 래퍼.
+struct ObjectInfoSheetData: Identifiable {
+    let id = UUID()
+    let info: PierObjectInfo
+}
+
 /// 선택한 연결의 파일 브라우저 본문.
 /// 쓰기 동작(업로드/이름/삭제)은 BrowserView+Write.swift의 extension이 담당한다.
 struct BrowserView: View {
@@ -27,6 +33,14 @@ struct BrowserView: View {
     @State var nameError: String?
     @State var pendingDelete: [PierEntry]?
     @State var actionError: String?
+    /// Quick Look 미리보기 상태. 스페이스바로 토글한다.
+    @State var preview = PreviewController()
+    /// 정보 보기 시트에 표시할 객체 정보. nil이면 시트가 닫힌다.
+    @State var objectInfo: ObjectInfoSheetData?
+    /// 짧은 안내 토스트("복사됨" 등).
+    @State var toastMessage: String?
+    /// 토스트 자동 닫기 세대 번호. 새 토스트가 이전 타이머를 무효화한다.
+    @State var toastGeneration = 0
 
     var body: some View {
         VStack(spacing: 0) {
@@ -38,11 +52,26 @@ struct BrowserView: View {
             }
             content
             if !transfers.items.isEmpty {
-                TransferBar(manager: transfers)
+                QueuePanel(manager: transfers)
             }
         }
         .navigationTitle(model.title)
         .toolbar { toolbarItems }
+        .onChange(of: selection) { _, _ in
+            preview.selectionDidChange(selected: selectedEntries)
+        }
+        .onAppear {
+            preview.onError = { message in actionError = message }
+        }
+        .overlay(alignment: .top) {
+            toastOverlay
+        }
+        .overlay(alignment: .bottom) {
+            PreviewHUD(preview: preview)
+        }
+        .sheet(item: $objectInfo) { data in
+            ObjectInfoSheet(info: data.info)
+        }
         .sheet(isPresented: conflictSheetPresented) {
             if let conflict = uploads.activeConflict {
                 UploadConflictSheet(conflict: conflict) { choice, applyToAll in
@@ -83,6 +112,21 @@ struct BrowserView: View {
             Button("확인") { actionError = nil }
         } message: {
             Text(actionError ?? "")
+        }
+    }
+
+    /// "복사됨" 같은 짧은 안내를 화면 상단에 띄운다.
+    @ViewBuilder
+    private var toastOverlay: some View {
+        if let toastMessage {
+            Text(toastMessage)
+                .font(.callout)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 6)
+                .background(.regularMaterial)
+                .clipShape(Capsule())
+                .padding(.top, 8)
+                .transition(.opacity)
         }
     }
 
@@ -207,6 +251,15 @@ struct BrowserView: View {
                 },
                 onUploadURLs: { urls, parent in
                     startUploads(urls, parent: parent)
+                },
+                onPresign: { entry, seconds in
+                    copyPresignedURL(entry: entry, expiresSecs: seconds)
+                },
+                onShowInfo: { entry in
+                    showObjectInfo(entry: entry)
+                },
+                onQuickLook: {
+                    quickLookSelection()
                 },
                 makePromiseHandler: { entry in
                     makePromiseHandler(for: entry)

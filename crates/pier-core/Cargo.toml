@@ -5,6 +5,8 @@ edition = "2021"
 publish = false
 
 [dependencies]
+# 0.4.35부터 default feature가 없으므로 set_boxed_logger 등을 위해 std를 켠다.
+log = { version = "0.4", features = ["std"] }
 opendal = { version = "0.59.5", default-features = false, features = [
     "services-s3",
     "http-transport-reqwest",
@@ -12,6 +14,16 @@ opendal = { version = "0.59.5", default-features = false, features = [
 ] }
 thiserror = "2.0.21"
 rusqlite = { version = "0.41.1", features = ["bundled"] }
+# reqwest는 opendal 트리와 동일한 feature(rustls + stream)만 켠다.
+reqwest = { version = "0.13", default-features = false, features = [
+    "rustls",
+    "stream",
+] }
+reqsign-core = "3"
+reqsign-aws-v4 = "3"
+# reqsign API가 http::request::Parts를 요구해 직접 의존한다(코디네이터 승인).
+http = "1"
+quick-xml = "0.42"
 tokio = { version = "1.54.1", features = [
     "fs",
     "io-util",

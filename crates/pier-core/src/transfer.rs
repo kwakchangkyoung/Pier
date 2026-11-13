@@ -24,6 +24,11 @@ use crate::error::Error;
 use crate::ignore;
 use crate::item::Item;
 use crate::key;
+use crate::s3_raw::{self, ResumableUpload, S3Raw};
+
+/// 이 크기보다 큰 업로드는 멀티파트이므로 `upload_resumable`로
+/// 이어올릴 수 있다. 16MB = part_size_for의 최소 파트 크기.
+pub const RESUMABLE_UPLOAD_MIN: u64 = 16 * 1024 * 1024;
 
 /// 병렬 다운로드 옵션. SPEC 4.4 기본값: 8MB 청크, 동시성 8.
 #[derive(Debug, Clone, Copy)]
@@ -46,6 +51,9 @@ impl Default for TransferOptions {
 pub trait ProgressSink: Send + Sync {
     /// 지금까지 받은 바이트 transferred / 전체 크기 total.
     fn on_progress(&self, transferred: u64, total: u64);
+    /// 폴더 작업의 파일 단위 진행: 완료 파일 수 done / 전체 파일 수 total.
+    /// 단일 파일 전송이나 바이트만 다루는 구현은 무시해도 된다.
+    fn on_files(&self, _done: u64, _total: u64) {}
 }
 
 /// 취소 토큰. 여러 태스크·스레드에서 `cancel()`을 호출할 수 있다.
@@ -101,35 +109,121 @@ pub async fn download<B>(
 where
     B: Backend + Clone + Send + Sync + 'static,
 {
+    let mut state = None;
+    match download_resumable(backend, key, dest, opts, &mut state, progress, cancel).await {
+        Ok(item) => Ok(item.size),
+        // 이어받기 정보는 쓰지 않으므로 남은 임시 파일을 지운다.
+        Err(err) => {
+            discard_download(&mut state).await;
+            Err(err)
+        }
+    }
+}
+
+/// 이어받기 가능한 단일 파일 다운로드의 메모리 상태.
+///
+/// `download_resumable`이 일시정지(취소 토큰)·실패로 중단될 때 채운다.
+/// 임시 파일(`.<이름>.pierdownload`)은 지우지 않고 남는다 — 다시 호출해
+/// 이어받거나 `discard_download`로 정리한다.
+#[derive(Debug, Clone)]
+pub struct ResumableDownload {
+    /// 시작 시점에 stat한 원격 ETag. 불투명 문자열로만 취급한다.
+    pub etag: Option<String>,
+    /// 시작 시점의 객체 크기(바이트).
+    pub size: u64,
+    /// 완료된 청크의 시작 오프셋 집합.
+    pub done_chunks: HashSet<u64>,
+    /// 부분 데이터가 담긴 임시 파일 경로.
+    pub tmp_path: PathBuf,
+}
+
+/// key 객체를 dest 파일로 다운로드하고 원격 stat Item을 반환한다.
+///
+/// `state`가 Some이고 원격 ETag·크기가 그대로면 완료된 청크를 건너뛰고
+/// 남은 청크만 받는다. 원격이 바뀌었거나 임시 파일이 없으면 처음부터 받는다.
+/// 일시정지·실패로 중단되면 진행 상태를 `state`에 채우고 Err를 반환한다
+/// (임시 파일은 남는다). 완전히 버리려면 `discard_download`를 호출한다.
+/// 성공하면 임시 파일을 dest로 옮기고 `state`를 비운다.
+pub async fn download_resumable<B>(
+    backend: &B,
+    key: &str,
+    dest: &Path,
+    opts: &TransferOptions,
+    state: &mut Option<ResumableDownload>,
+    progress: &dyn ProgressSink,
+    cancel: &CancelToken,
+) -> Result<Item, Error>
+where
+    B: Backend + Clone + Send + Sync + 'static,
+{
     if cancel.is_cancelled() {
         return Err(cancelled_error());
     }
-    // 크기 확인을 겸해 없는 키는 여기서 NotFound가 난다.
+    // 크기·ETag 확인을 겸해 없는 키는 여기서 NotFound가 난다.
     let item = backend.stat(key).await?;
     if item.is_dir {
         return Err(Error::Other(format!("{key}는 폴더라 다운로드할 수 없다")));
     }
     let size = item.size;
-
     let tmp = temp_path(dest);
-    if let Err(err) = download_inner(backend, key, &tmp, size, opts, progress, cancel).await {
-        let _ = tokio::fs::remove_file(&tmp).await;
-        return Err(err);
+
+    // 이전 상태를 쓸 수 있는지 확인한다. 원격이 바뀌었거나(ETag·크기)
+    // 임시 파일이 유효하지 않으면 버리고 처음부터 받는다.
+    let mut done_chunks = HashSet::new();
+    if let Some(prev) = state.take() {
+        let usable = prev.etag == item.etag
+            && prev.size == size
+            && prev.tmp_path == tmp
+            && matches!(tokio::fs::metadata(&prev.tmp_path).await, Ok(m) if m.len() == size);
+        if usable {
+            done_chunks = prev.done_chunks;
+        } else {
+            let _ = tokio::fs::remove_file(&prev.tmp_path).await;
+        }
     }
-    if let Err(err) = tokio::fs::rename(&tmp, dest).await {
-        let _ = tokio::fs::remove_file(&tmp).await;
-        return Err(err.into());
+
+    let mut run = ResumableDownload {
+        etag: item.etag.clone(),
+        size,
+        done_chunks,
+        tmp_path: tmp.clone(),
+    };
+    match run_download(backend, key, &tmp, size, &mut run, opts, progress, cancel).await {
+        Ok(()) => match tokio::fs::rename(&tmp, dest).await {
+            Ok(()) => {
+                *state = None;
+                Ok(item)
+            }
+            // rename 실패도 이어받기 가능하다 — 모든 청크는 tmp에 있다.
+            Err(err) => {
+                *state = Some(run);
+                Err(err.into())
+            }
+        },
+        Err(err) => {
+            *state = Some(run);
+            Err(err)
+        }
     }
-    Ok(size)
 }
 
-/// 임시 파일에 전체 바이트를 쓴다. 호출자가 성공·실패 모두 임시 파일을
-/// 정리할 책임을 진다.
-async fn download_inner<B>(
+/// 이어받기를 포기하고 남은 임시 파일을 지운다.
+pub async fn discard_download(state: &mut Option<ResumableDownload>) {
+    if let Some(prev) = state.take() {
+        let _ = tokio::fs::remove_file(&prev.tmp_path).await;
+    }
+}
+
+/// 임시 파일에 전체 바이트를 쓴다. run.done_chunks에 있는 오프셋의
+/// 청크는 건너뛰고, 완료한 청크는 run에 누적해 호출자가 중단 지점을
+/// 알 수 있게 한다.
+#[allow(clippy::too_many_arguments)]
+async fn run_download<B>(
     backend: &B,
     key: &str,
     tmp: &Path,
     size: u64,
+    run: &mut ResumableDownload,
     opts: &TransferOptions,
     progress: &dyn ProgressSink,
     cancel: &CancelToken,
@@ -139,18 +233,37 @@ where
 {
     // 목적 크기로 미리 길이를 잡는다(희소 파일). 청크 태스크는 각자
     // 파일 핸들을 열어 오프셋에 직접 쓰므로 순서와 무관하게 완성된다.
-    let file = tokio::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(tmp)
-        .await?;
-    file.set_len(size).await?;
-    drop(file);
+    // 이어받는 임시 파일은 이미 그 크기이므로 새로 만들 때만 초기화한다.
+    let needs_create = match tokio::fs::metadata(tmp).await {
+        Ok(m) => m.len() != size,
+        Err(_) => true,
+    };
+    if needs_create {
+        let file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(tmp)
+            .await?;
+        file.set_len(size).await?;
+        drop(file);
+        // 크기가 다른 임시 파일 위에서는 완료 표시를 신뢰할 수 없다.
+        run.done_chunks.clear();
+    }
 
     if size == 0 {
         progress.on_progress(0, 0);
         return Ok(());
+    }
+
+    // 이전에 받아 둔 청크를 초기 진행률로 합산한다.
+    let mut transferred: u64 = run
+        .done_chunks
+        .iter()
+        .map(|off| opts.chunk_size.max(1).min(size.saturating_sub(*off)))
+        .sum();
+    if transferred > 0 {
+        progress.on_progress(transferred, size);
     }
 
     // 동시 요청 수는 세마포어로 제한한다. 청크 수만큼 태스크를 만들지만
@@ -158,6 +271,9 @@ where
     let sem = Arc::new(Semaphore::new(opts.concurrency.max(1)));
     let mut set = JoinSet::new();
     for (offset, len) in chunk_ranges(size, opts.chunk_size) {
+        if run.done_chunks.contains(&offset) {
+            continue;
+        }
         let backend = backend.clone();
         let key = key.to_string();
         let tmp = tmp.to_path_buf();
@@ -168,11 +284,12 @@ where
                 .acquire()
                 .await
                 .map_err(|e| Error::Other(format!("전송 세마포어 오류: {e}")))?;
-            fetch_chunk(&backend, &key, &tmp, offset, len, &cancel).await
+            fetch_chunk(&backend, &key, &tmp, offset, len, &cancel)
+                .await
+                .map(|bytes| (offset, bytes))
         });
     }
 
-    let mut transferred = 0u64;
     loop {
         let joined = tokio::select! {
             biased;
@@ -185,7 +302,8 @@ where
         match joined {
             // 모든 청크 완료.
             None => break,
-            Some(Ok(Ok(done))) => {
+            Some(Ok(Ok((offset, done)))) => {
+                run.done_chunks.insert(offset);
                 transferred += done;
                 progress.on_progress(transferred, size);
                 if cancel.is_cancelled() {
@@ -250,6 +368,55 @@ pub async fn download_folder<B>(
 where
     B: Backend + Clone + Send + Sync + 'static,
 {
+    let mut state = None;
+    match download_folder_resumable(
+        backend, prefix, dest_dir, opts, &mut state, progress, cancel,
+    )
+    .await
+    {
+        Ok(result) => Ok(result),
+        // 이어받기 정보는 쓰지 않으므로 미완료 임시 파일을 지운다.
+        Err(err) => {
+            discard_folder_download(&mut state).await;
+            Err(err)
+        }
+    }
+}
+
+/// 폴더 다운로드의 이어받기 상태.
+///
+/// `download_folder_resumable`이 일시정지·실패로 중단될 때 채운다.
+/// 완료(rename)된 파일의 임시 파일은 없고, 진행 중 파일의 임시 파일은
+/// 남는다 — 다시 호출해 이어받거나 `discard_folder_download`로 정리한다.
+#[derive(Debug, Clone, Default)]
+pub struct ResumableFolderDownload {
+    /// 처음에 확정된 대상 디렉터리(` (N)` 접미사 포함). 재개 시 같은
+    /// 디렉터리로 이어간다.
+    pub target: PathBuf,
+    /// 다운로드를 마친 파일의 S3 키.
+    pub done: HashSet<String>,
+    /// 진행 중이던 파일의 청크 상태(키 → 상태).
+    pub in_progress: HashMap<String, ResumableDownload>,
+}
+
+/// `download_folder`와 같은 규칙으로 폴더를 받되 `state`로 이어받는다.
+///
+/// `state`가 Some이면 처음에 확정된 대상 디렉터리를 재사용하고, 완료된
+/// 파일을 건너뛰며, 진행 중이던 파일은 남은 청크만 받는다. 파일의 원격
+/// ETag·크기가 바뀌었거나 임시 파일이 없으면 그 파일만 처음부터 받는다.
+/// 중단되면 `state`를 갱신하고 Err를 반환한다. 성공하면 `state`를 비운다.
+pub async fn download_folder_resumable<B>(
+    backend: &B,
+    prefix: &str,
+    dest_dir: &Path,
+    opts: &TransferOptions,
+    state: &mut Option<ResumableFolderDownload>,
+    progress: &dyn ProgressSink,
+    cancel: &CancelToken,
+) -> Result<FolderDownload, Error>
+where
+    B: Backend + Clone + Send + Sync + 'static,
+{
     if cancel.is_cancelled() {
         return Err(cancelled_error());
     }
@@ -268,32 +435,102 @@ where
         .filter(|item| item.key != prefix && item.key.starts_with(&prefix))
         .collect();
 
-    // 대상 폴더명은 마지막 키 구간을 안전한 로컬 이름으로 바꾼 값이다.
-    let folder_name = safe_rel_path(key::name(&prefix))
-        .to_string_lossy()
-        .into_owned();
-    let target = unique_target_dir(dest_dir, &folder_name)?;
+    // 대상 디렉터리는 처음 확정한 것을 그대로 쓴다 — 재개 때 새 " (N)"
+    // 경로를 뽑으면 이전에 받은 파일과 어긋난다.
+    let prev = state.take().unwrap_or_default();
+    let target = if prev.target.as_os_str().is_empty() {
+        // 대상 폴더명은 마지막 키 구간을 안전한 로컬 이름으로 바꾼 값이다.
+        let folder_name = safe_rel_path(key::name(&prefix))
+            .to_string_lossy()
+            .into_owned();
+        unique_target_dir(dest_dir, &folder_name)?
+    } else {
+        prev.target
+    };
     let plan = plan_layout(&target, &prefix, &items)?;
+
+    // 이전 상태를 파일 인덱스로 옮긴다. 목록에서 사라졌거나 원격이
+    // 바뀐 파일의 임시 파일은 버리고 처음부터 받는다.
+    let index_by_key: HashMap<&str, usize> = plan
+        .files
+        .iter()
+        .enumerate()
+        .map(|(i, f)| (f.key.as_str(), i))
+        .collect();
+    let mut run = FolderDlState {
+        done_chunks: vec![HashSet::new(); plan.files.len()],
+        finished: vec![false; plan.files.len()],
+    };
+    for key in &prev.done {
+        if let Some(&idx) = index_by_key.get(key.as_str()) {
+            run.finished[idx] = true;
+        }
+    }
+    for (key, rd) in prev.in_progress {
+        let Some(&idx) = index_by_key.get(key.as_str()) else {
+            let _ = tokio::fs::remove_file(&rd.tmp_path).await;
+            continue;
+        };
+        let job = &plan.files[idx];
+        let usable = rd.etag == job.etag
+            && rd.size == job.size
+            && rd.tmp_path == job.tmp
+            && matches!(tokio::fs::metadata(&rd.tmp_path).await, Ok(m) if m.len() == job.size);
+        if usable {
+            run.done_chunks[idx] = rd.done_chunks;
+        } else {
+            let _ = tokio::fs::remove_file(&rd.tmp_path).await;
+        }
+    }
 
     let total_bytes: u64 = plan.files.iter().map(|f| f.size).sum();
     let file_count = plan.files.len() as u64;
-    // 목록을 받은 직후 진행률 초기값을 한 번 보낸다.
-    progress.on_progress(0, total_bytes);
-
-    // 실패·취소 시 미완료 임시 파일을 지운다. 이미 rename된 파일은 둔다.
-    let result = run_folder_download(backend, &plan, &target, opts, progress, cancel).await;
-    if result.is_err() {
-        for job in &plan.files {
-            let _ = tokio::fs::remove_file(&job.tmp).await;
+    match run_folder_download(backend, &plan, &target, opts, progress, cancel, &mut run).await {
+        Ok(()) => {
+            *state = None;
+            Ok(FolderDownload {
+                local_path: target,
+                file_count,
+                total_bytes,
+            })
+        }
+        Err(err) => {
+            // 중단 지점을 상태로 남긴다 — 완료 파일 목록과 진행 중
+            // 파일의 청크·임시 파일 정보를 모두 보존한다.
+            let mut resume = ResumableFolderDownload {
+                target,
+                done: HashSet::new(),
+                in_progress: HashMap::new(),
+            };
+            for (idx, job) in plan.files.iter().enumerate() {
+                if run.finished[idx] {
+                    resume.done.insert(job.key.clone());
+                } else {
+                    resume.in_progress.insert(
+                        job.key.clone(),
+                        ResumableDownload {
+                            etag: job.etag.clone(),
+                            size: job.size,
+                            done_chunks: std::mem::take(&mut run.done_chunks[idx]),
+                            tmp_path: job.tmp.clone(),
+                        },
+                    );
+                }
+            }
+            *state = Some(resume);
+            Err(err)
         }
     }
-    result?;
+}
 
-    Ok(FolderDownload {
-        local_path: target,
-        file_count,
-        total_bytes,
-    })
+/// 폴더 다운로드 이어받기를 포기하고 진행 중 파일의 임시 파일을 지운다.
+/// 완료(rename된) 파일과 대상 디렉터리는 그대로 둔다.
+pub async fn discard_folder_download(state: &mut Option<ResumableFolderDownload>) {
+    if let Some(prev) = state.take() {
+        for rd in prev.in_progress.values() {
+            let _ = tokio::fs::remove_file(&rd.tmp_path).await;
+        }
+    }
 }
 
 /// 폴더 다운로드의 로컬 경로 계획.
@@ -309,6 +546,8 @@ struct FileJob {
     /// S3 키.
     key: String,
     size: u64,
+    /// 원격 ETag — 이어받기 때 같은 객체인지 확인하는 데 쓴다.
+    etag: Option<String>,
     /// 임시 파일(`.<이름>.pierdownload`).
     tmp: PathBuf,
     /// 최종 경로.
@@ -320,7 +559,7 @@ struct FileJob {
 /// 충돌하면 파일 이름을 바꿔 피한다.
 fn plan_layout(target: &Path, prefix: &str, items: &[Item]) -> Result<FolderPlan, Error> {
     let mut dir_set: HashSet<PathBuf> = HashSet::new();
-    let mut file_rels: Vec<(&str, u64, PathBuf)> = Vec::new();
+    let mut file_rels: Vec<(&str, u64, Option<String>, PathBuf)> = Vec::new();
 
     for item in items {
         let rel_key = &item.key[prefix.len()..];
@@ -333,14 +572,14 @@ fn plan_layout(target: &Path, prefix: &str, items: &[Item]) -> Result<FolderPlan
         } else {
             let rel = safe_rel_path(rel_key);
             insert_ancestors(&mut dir_set, &rel);
-            file_rels.push((item.key.as_str(), item.size, rel));
+            file_rels.push((item.key.as_str(), item.size, item.etag.clone(), rel));
         }
     }
 
     // 디렉터리는 이미 점유된 경로로 보고 파일 목적지를 배정한다.
     let mut taken = dir_set.clone();
     let mut files = Vec::with_capacity(file_rels.len());
-    for (key, size, rel) in file_rels {
+    for (key, size, etag, rel) in file_rels {
         let base = if dir_set.contains(&rel) {
             // 객체 `a`와 폴더 `a/`가 공존하면 파일이 폴더를 가리지 않게
             // 파일 이름 뒤에 ' (파일)'을 붙인다.
@@ -364,6 +603,7 @@ fn plan_layout(target: &Path, prefix: &str, items: &[Item]) -> Result<FolderPlan
         files.push(FileJob {
             key: key.to_string(),
             size,
+            etag,
             tmp: temp_path(&dest),
             dest,
         });
@@ -456,9 +696,20 @@ fn check_symlinks(target: &Path, path: &Path) -> Result<(), Error> {
     Ok(())
 }
 
+/// 폴더 다운로드의 파일별 진행 상태. 재개 입력이자 중단 시 출력이다.
+struct FolderDlState {
+    /// 파일 인덱스 → 받은 청크 오프셋.
+    done_chunks: Vec<HashSet<u64>>,
+    /// 파일 인덱스 → 완료(rename까지 끝남) 여부.
+    finished: Vec<bool>,
+}
+
 /// 디렉터리 생성과 파일 다운로드를 실행한다.
 /// 모든 파일의 청크를 하나의 JoinSet에 넣고 공유 세마포어로 총 동시 요청
 /// 수를 opts.concurrency로 제한한다. 파일이 끝날 때마다 tmp를 dest로 rename한다.
+/// `run`에 이전 실행의 완료 청크가 있으면 건너뛰고, 실행 중 완료한 청크를
+/// 누적해 호출자가 중단 지점을 재구성할 수 있게 한다.
+#[allow(clippy::too_many_arguments)]
 async fn run_folder_download<B>(
     backend: &B,
     plan: &FolderPlan,
@@ -466,6 +717,7 @@ async fn run_folder_download<B>(
     opts: &TransferOptions,
     progress: &dyn ProgressSink,
     cancel: &CancelToken,
+    run: &mut FolderDlState,
 ) -> Result<(), Error>
 where
     B: Backend + Clone + Send + Sync + 'static,
@@ -476,10 +728,20 @@ where
         tokio::fs::create_dir_all(dir).await?;
     }
 
+    let files_total = plan.files.len() as u64;
+    let mut files_done = run.finished.iter().filter(|f| **f).count() as u64;
+    progress.on_files(files_done, files_total);
+
     // 0바이트 파일은 청크가 없으므로 임시 파일을 만들어 바로 완료시킨다.
-    for job in plan.files.iter().filter(|f| f.size == 0) {
+    for (idx, job) in plan.files.iter().enumerate() {
+        if job.size != 0 || run.finished[idx] {
+            continue;
+        }
         tokio::fs::write(&job.tmp, b"").await?;
         tokio::fs::rename(&job.tmp, &job.dest).await?;
+        run.finished[idx] = true;
+        files_done += 1;
+        progress.on_files(files_done, files_total);
     }
 
     // 파일별 남은 바이트. 모두 받으면 tmp를 dest로 rename한다.
@@ -487,20 +749,47 @@ where
     let sem = Arc::new(Semaphore::new(opts.concurrency.max(1)));
     let mut set = JoinSet::new();
     for (idx, job) in plan.files.iter().enumerate() {
+        if run.finished[idx] {
+            remaining[idx] = 0;
+            continue;
+        }
         if job.size == 0 {
             continue;
         }
-        // 목적 크기로 미리 길이를 잡는다(희소 파일).
-        let file = tokio::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&job.tmp)
-            .await?;
-        file.set_len(job.size).await?;
-        drop(file);
+        // 이어받는 임시 파일은 이미 목적 크기라 그대로 쓰고, 아니면
+        // 목적 크기로 새로 만든다(희소 파일).
+        let keep = !run.done_chunks[idx].is_empty()
+            && matches!(tokio::fs::metadata(&job.tmp).await, Ok(m) if m.len() == job.size);
+        if !keep {
+            run.done_chunks[idx].clear();
+            let file = tokio::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&job.tmp)
+                .await?;
+            file.set_len(job.size).await?;
+            drop(file);
+        }
+        // 미리 받아 둔 청크는 remaining에서 뺀다.
+        let pre: u64 = run.done_chunks[idx]
+            .iter()
+            .map(|off| opts.chunk_size.max(1).min(job.size.saturating_sub(*off)))
+            .sum();
+        remaining[idx] = job.size - pre;
+        if remaining[idx] == 0 {
+            // 모든 청크가 있던 파일은 바로 완료한다.
+            tokio::fs::rename(&job.tmp, &job.dest).await?;
+            run.finished[idx] = true;
+            files_done += 1;
+            progress.on_files(files_done, files_total);
+            continue;
+        }
 
         for (offset, len) in chunk_ranges(job.size, opts.chunk_size) {
+            if run.done_chunks[idx].contains(&offset) {
+                continue;
+            }
             let backend = backend.clone();
             let key = job.key.clone();
             let tmp = job.tmp.clone();
@@ -513,13 +802,20 @@ where
                     .map_err(|e| Error::Other(format!("전송 세마포어 오류: {e}")))?;
                 fetch_chunk(&backend, &key, &tmp, offset, len, &cancel)
                     .await
-                    .map(|bytes| (idx, bytes))
+                    .map(|bytes| (idx, offset, bytes))
             });
         }
     }
 
     let total_bytes: u64 = plan.files.iter().map(|f| f.size).sum();
-    let mut done = 0u64;
+    // 완료 파일과 미리 받은 청크를 초기 진행률로 합산한다.
+    let mut done: u64 = plan
+        .files
+        .iter()
+        .enumerate()
+        .map(|(idx, f)| f.size - remaining[idx])
+        .sum();
+    progress.on_progress(done, total_bytes);
     loop {
         let joined = tokio::select! {
             biased;
@@ -532,9 +828,10 @@ where
         match joined {
             // 모든 청크 완료.
             None => break,
-            Some(Ok(Ok((idx, bytes)))) => {
+            Some(Ok(Ok((idx, offset, bytes)))) => {
                 done += bytes;
                 remaining[idx] -= bytes;
+                run.done_chunks[idx].insert(offset);
                 progress.on_progress(done, total_bytes);
                 if remaining[idx] == 0 {
                     let job = &plan.files[idx];
@@ -542,6 +839,9 @@ where
                         set.abort_all();
                         return Err(err.into());
                     }
+                    run.finished[idx] = true;
+                    files_done += 1;
+                    progress.on_files(files_done, files_total);
                 }
                 if cancel.is_cancelled() {
                     set.abort_all();
@@ -709,6 +1009,52 @@ pub async fn upload_folder<B>(
 where
     B: Backend + Clone + Send + Sync + 'static,
 {
+    let mut state = None;
+    // 이어올리기 백엔드(raw)가 없으면 큰 파일도 put_file 멀티파트로
+    // 처리하고, 취소·실패 시 그 안에서 abort한다 — 기존 동작과 같다.
+    upload_folder_resumable(
+        backend, None, src_dir, parent, mode, opts, &mut state, progress, cancel,
+    )
+    .await
+}
+
+/// 폴더 업로드의 이어올리기 상태.
+///
+/// `upload_folder_resumable`이 일시정지·실패로 중단될 때 채운다.
+/// `in_progress`의 멀티파트 업로드는 abort되지 않고 남는다 — 다시 호출해
+/// 이어올리거나 호출자가 `s3_raw::abort_upload`로 정리한다.
+#[derive(Debug, Clone, Default)]
+pub struct ResumableFolderUpload {
+    /// 업로드를 마친 파일의 상대 경로(rel).
+    pub done: HashSet<String>,
+    /// 파일별로 확정된 원격 키(rel → 키). KeepBoth로 고른 이름이 재개 때
+    /// 바뀌지 않게 계획 시점에 확정해 둔다.
+    pub resolved: HashMap<String, String>,
+    /// 진행 중이던 파일의 멀티파트 상태(rel → 상태).
+    pub in_progress: HashMap<String, ResumableUpload>,
+}
+
+/// `upload_folder`와 같은 규칙으로 올리되 `state`로 이어올린다.
+///
+/// `state`가 Some이면 확정된 원격 키를 재사용하고 완료된 파일을 건너뛰며,
+/// 진행 중이던 파일은 `upload_resumable`로 이어 올린다. `raw`가 None이면
+/// 큰 파일도 put_file 멀티파트로 올린다(중단 시 그 파일은 처음부터).
+/// 중단되면 `state`를 갱신하고 Err를 반환한다. 성공하면 `state`를 비운다.
+#[allow(clippy::too_many_arguments)]
+pub async fn upload_folder_resumable<B>(
+    backend: &B,
+    raw: Option<Arc<S3Raw>>,
+    src_dir: &Path,
+    parent: &str,
+    mode: &UploadMode,
+    opts: &TransferOptions,
+    state: &mut Option<ResumableFolderUpload>,
+    progress: &dyn ProgressSink,
+    cancel: &CancelToken,
+) -> Result<FolderUpload, Error>
+where
+    B: Backend + Clone + Send + Sync + 'static,
+{
     if cancel.is_cancelled() {
         return Err(cancelled_error());
     }
@@ -731,8 +1077,6 @@ where
     // 로컬 트리 스캔: 파일 목록, 빈 디렉터리 마커 목록, 무시 수.
     let mut tree = LocalTree::default();
     let has_content = scan_dir(src_dir, "", &mut tree, cancel).await?;
-    let total_bytes: u64 = tree.files.iter().map(|f| f.size).sum();
-    progress.on_progress(0, total_bytes);
 
     // 업로드 대상이 하나도 없으면 대상 폴더 마커만 만들고 끝낸다.
     if !has_content {
@@ -740,6 +1084,7 @@ where
             return Err(cancelled_error());
         }
         backend.create_dir(&target_prefix).await?;
+        *state = None;
         return Ok(FolderUpload {
             uploaded: 0,
             ignored: tree.ignored,
@@ -748,13 +1093,46 @@ where
         });
     }
 
-    // 파일별 최종 키를 확정한다(KeepBoth는 여기서 이름을 고른다).
-    let jobs = resolve_upload_jobs(backend, &tree, &target_prefix, mode, opts).await?;
+    let mut resume = state.take().unwrap_or_default();
+    // 완료로 표시된 파일이 실제로는 지워졌으면 done에서 뺀다.
+    let on_disk: HashSet<&str> = tree.files.iter().map(|f| f.rel.as_str()).collect();
+    resume.done.retain(|rel| on_disk.contains(rel.as_str()));
+
+    // 파일별 최종 키를 확정한다. 이미 확정된 것은 재사용하고, 새로
+    // 필요한 파일만 KeepBoth 이름을 배치로 고른다.
+    let unresolved: Vec<LocalFile> = tree
+        .files
+        .iter()
+        .filter(|f| !resume.resolved.contains_key(&f.rel))
+        .cloned()
+        .collect();
+    if !unresolved.is_empty() {
+        // 확정된 키의 파일명은 KeepBoth 해석에서 점유로 본다 — 진행 중
+        // 멀티파트가 잡은 키를 다른 파일이 다시 고르는 일이 없게 한다.
+        let mut reserved: HashMap<String, HashSet<String>> = HashMap::new();
+        for remote_key in resume.resolved.values() {
+            reserved
+                .entry(key::parent(remote_key).to_string())
+                .or_default()
+                .insert(key::name(remote_key).to_string());
+        }
+        let mini = LocalTree {
+            files: unresolved,
+            markers: Vec::new(),
+            ignored: 0,
+        };
+        for job in
+            resolve_upload_jobs(backend, &mini, &target_prefix, mode, opts, &reserved).await?
+        {
+            resume.resolved.insert(job.rel.clone(), job.remote_key);
+        }
+    }
 
     // 내용이 없는 디렉터리의 폴더 마커를 만든다. 순차 실행이지만
     // 마커 수는 디렉터리 수에 불과해 동시성 제한 없이 처리한다.
     for rel in &tree.markers {
         if cancel.is_cancelled() {
+            *state = Some(resume);
             return Err(cancelled_error());
         }
         backend
@@ -762,17 +1140,49 @@ where
             .await?;
     }
 
-    run_upload_jobs(
+    let total_bytes: u64 = tree.files.iter().map(|f| f.size).sum();
+    // 남은 파일만 작업으로 만든다.
+    let jobs: Vec<UploadJob> = tree
+        .files
+        .iter()
+        .filter(|f| !resume.done.contains(&f.rel))
+        .map(|f| UploadJob {
+            src: f.path.clone(),
+            rel: f.rel.clone(),
+            remote_key: resume
+                .resolved
+                .get(&f.rel)
+                .cloned()
+                .unwrap_or_else(|| format!("{target_prefix}{}", f.rel)),
+            size: f.size,
+            weight: upload_weight(f.size, opts.concurrency),
+            slot: Arc::new(AtomicU64::new(0)),
+        })
+        .collect();
+
+    match run_upload_jobs(
         backend,
+        raw,
         jobs,
         mode,
-        opts,
+        *opts,
         tree.ignored,
         total_bytes,
         progress,
         cancel,
+        &mut resume,
     )
     .await
+    {
+        Ok(result) => {
+            *state = None;
+            Ok(result)
+        }
+        Err(err) => {
+            *state = Some(resume);
+            Err(err)
+        }
+    }
 }
 
 /// parent 아래 names 중 이미 존재하는 항목만 반환한다(stat 기준).
@@ -815,7 +1225,7 @@ fn part_size_for(size: u64) -> u64 {
 }
 
 /// UploadMode를 WriteCondition으로 변환한다.
-fn mode_condition(mode: &UploadMode) -> WriteCondition {
+pub(crate) fn mode_condition(mode: &UploadMode) -> WriteCondition {
     match mode {
         UploadMode::Fail | UploadMode::KeepBoth => WriteCondition::NotExists,
         UploadMode::Replace { if_match } => match if_match {
@@ -859,6 +1269,7 @@ struct LocalTree {
     ignored: u64,
 }
 
+#[derive(Clone)]
 struct LocalFile {
     path: PathBuf,
     /// src_dir 기준 상대 경로('/' 구분, 디렉터리 포함 가능).
@@ -925,6 +1336,8 @@ async fn scan_dir(
 /// 파일별 업로드 작업.
 struct UploadJob {
     src: PathBuf,
+    /// src_dir 기준 상대 경로('/' 구분). 이어올리기 상태의 키로 쓴다.
+    rel: String,
     remote_key: String,
     size: u64,
     /// 이 파일이 잡는 세마포어 허가 수(파트 수 상한, 1~concurrency).
@@ -934,12 +1347,15 @@ struct UploadJob {
 }
 
 /// 파일 작업 목록을 만들고 KeepBoth 이름을 확정한다.
+/// `reserved`는 KeepBoth 해석에서 이미 점유된 것으로 볼
+/// (부모 접두사 → 이름 집합) — 재개 때 확정된 키와 충돌하지 않게 한다.
 async fn resolve_upload_jobs<B>(
     backend: &B,
     tree: &LocalTree,
     target_prefix: &str,
     mode: &UploadMode,
     opts: &TransferOptions,
+    reserved: &HashMap<String, HashSet<String>>,
 ) -> Result<Vec<UploadJob>, Error>
 where
     B: Backend + Send + Sync,
@@ -947,6 +1363,7 @@ where
     // 각 파일의 (원격 부모 접두사, 파일 이름, 기본 키).
     struct Pending {
         src: PathBuf,
+        rel: String,
         parent_prefix: String,
         name: String,
         base_key: String,
@@ -962,6 +1379,7 @@ where
         let parent_prefix = format!("{target_prefix}{dir_rel}");
         pending.push(Pending {
             src: f.path.clone(),
+            rel: f.rel.clone(),
             parent_prefix,
             name: name.to_string(),
             base_key: format!("{target_prefix}{}", f.rel),
@@ -976,12 +1394,15 @@ where
         prefixes.sort();
         prefixes.dedup();
         for prefix in prefixes {
-            let taken: HashSet<String> = backend
+            let mut taken: HashSet<String> = backend
                 .list_folder(&prefix)
                 .await?
                 .iter()
                 .map(|i| i.name.clone())
                 .collect();
+            if let Some(extra) = reserved.get(&prefix) {
+                taken.extend(extra.iter().cloned());
+            }
             taken_by_prefix.insert(prefix, taken);
         }
     }
@@ -1002,6 +1423,7 @@ where
         };
         jobs.push(UploadJob {
             src: p.src,
+            rel: p.rel,
             remote_key,
             size: p.size,
             weight: upload_weight(p.size, opts.concurrency),
@@ -1038,17 +1460,24 @@ impl ProgressSink for SlotProgress {
 
 /// 파일 업로드 작업들을 공유 세마포어로 실행하고 진행률을 합산 보고한다.
 /// Conflict는 mode에 따라 파일 단위로 건너뛴다(Fail·KeepBoth → skipped,
-/// Replace는 전체 실패). 그 외 오류·취소는 남은 작업을 중단한다.
+/// Replace는 전체 실패). 그 외 오류·취소는 남은 작업에 stop을 보내고
+/// 각 태스크가 돌려주는 상태까지 다 거둔다 — 멀티파트 ID가 든 상태를
+/// 버리면 서버에 고아 업로드가 남기 때문이다.
+///
+/// `resume`의 in_progress에 든 상태는 같은 rel의 큰 파일에 이어 쓰고,
+/// 태스크가 돌려준 상태는 다시 `resume`에 넣는다(성공 파일은 제외).
 #[allow(clippy::too_many_arguments)]
 async fn run_upload_jobs<B>(
     backend: &B,
+    raw: Option<Arc<S3Raw>>,
     jobs: Vec<UploadJob>,
     mode: &UploadMode,
-    opts: &TransferOptions,
+    opts: TransferOptions,
     ignored: u64,
     total_bytes: u64,
     progress: &dyn ProgressSink,
     cancel: &CancelToken,
+    resume: &mut ResumableFolderUpload,
 ) -> Result<FolderUpload, Error>
 where
     B: Backend + Clone + Send + Sync + 'static,
@@ -1058,79 +1487,139 @@ where
     let sem = Arc::new(Semaphore::new(opts.concurrency.max(1)));
     let uploaded = Arc::new(AtomicU64::new(0));
     let skipped = Arc::new(AtomicU64::new(0));
+    // 이미 완료된 파일 바이트가 진행률의 시작점이다.
+    let baseline_bytes: u64 = total_bytes.saturating_sub(jobs.iter().map(|j| j.size).sum::<u64>());
     // 진행률 합산용으로 슬롯 Arc를 spawn 전에 모아 둔다.
     let slots: Vec<Arc<AtomicU64>> = jobs.iter().map(|j| Arc::clone(&j.slot)).collect();
+    let files_total = (resume.done.len() + jobs.len()) as u64;
+    let files_done = Arc::new(AtomicU64::new(resume.done.len() as u64));
+    progress.on_files(files_done.load(Ordering::SeqCst), files_total);
+    // stop은 호출자 취소와 첫 실패를 태스크에 전달하는 내부 토큰이다.
+    let stop = CancelToken::new();
     let mut set = JoinSet::new();
+    // 이전 실행의 멀티파트 상태를 rel로 태스크에 배정한다.
+    let mut part_states = std::mem::take(&mut resume.in_progress);
 
     for job in jobs {
         let backend = backend.clone();
-        let cancel = cancel.clone();
+        let stop = stop.clone();
         let sem = Arc::clone(&sem);
-        let uploaded = Arc::clone(&uploaded);
-        let skipped = Arc::clone(&skipped);
-        let popts = PutOptions {
-            condition: condition.clone(),
-            part_size: part_size_for(job.size),
-            concurrency: job.weight as usize,
-        };
+        let condition = condition.clone();
+        let raw = raw.clone();
+        let part_state = part_states.remove(&job.rel);
         set.spawn(async move {
             // 이 파일의 예상 파트 수만큼 허가를 잡는다. 허가 수 =
             // min(파트 수, concurrency)라 총 동시 요청이 상한을 넘지 않는다.
-            let _permit = sem
-                .acquire_many(job.weight)
-                .await
-                .map_err(|e| Error::Other(format!("전송 세마포어 오류: {e}")))?;
+            // 허가 대기도 취소에 응답하게 한다.
+            let permit = tokio::select! {
+                biased;
+                _ = stop.cancelled() => return (job, part_state, Err(cancelled_error())),
+                p = sem.acquire_many(job.weight) => {
+                    p.map_err(|e| Error::Other(format!("전송 세마포어 오류: {e}")))
+                }
+            };
+            let _permit = match permit {
+                Ok(p) => p,
+                Err(e) => return (job, part_state, Err(e)),
+            };
             let sink = SlotProgress {
                 done: Arc::clone(&job.slot),
             };
-            match backend
-                .put_file(&job.remote_key, &job.src, popts, &sink, &cancel)
-                .await
-            {
-                Ok(()) => {
-                    uploaded.fetch_add(1, Ordering::SeqCst);
-                    Ok(())
+            let mut part_state = part_state;
+            // 큰 파일 + raw 백엔드가 있을 때만 이어올리기 경로를 쓴다.
+            let result = match (raw, job.size > RESUMABLE_UPLOAD_MIN) {
+                (Some(raw), true) => {
+                    s3_raw::upload_resumable(
+                        &raw,
+                        &job.src,
+                        &job.remote_key,
+                        condition.clone(),
+                        &opts,
+                        &mut part_state,
+                        &sink,
+                        &stop,
+                    )
+                    .await
                 }
-                Err(Error::Conflict(_)) if skip_on_conflict => {
-                    skipped.fetch_add(1, Ordering::SeqCst);
-                    Ok(())
+                _ => {
+                    let popts = PutOptions {
+                        condition: condition.clone(),
+                        part_size: part_size_for(job.size),
+                        concurrency: job.weight as usize,
+                    };
+                    backend
+                        .put_file(&job.remote_key, &job.src, popts, &sink, &stop)
+                        .await
                 }
-                Err(e) => Err(e),
-            }
+            };
+            (job, part_state, result)
         });
     }
 
     // 진행률은 슬롯 합산을 100ms마다 보고한다.
     let mut tick = tokio::time::interval(std::time::Duration::from_millis(100));
+    let mut first_err: Option<Error> = None;
+    let mut stop_sent = false;
     loop {
         tokio::select! {
             biased;
-            _ = cancel.cancelled() => {
-                set.abort_all();
-                return Err(cancelled_error());
+            _ = cancel.cancelled(), if !stop_sent => {
+                stop.cancel();
+                stop_sent = true;
             }
             _ = tick.tick() => {
-                let done: u64 = slots.iter().map(|s| s.load(Ordering::SeqCst)).sum();
+                let done: u64 = slots.iter().map(|s| s.load(Ordering::SeqCst)).sum::<u64>()
+                    + baseline_bytes;
                 progress.on_progress(done, total_bytes);
             }
             joined = set.join_next() => {
-                match joined {
+                let (job, part_state, result) = match joined {
                     None => break,
-                    Some(Ok(Ok(()))) => {}
-                    Some(Ok(Err(err))) => {
-                        set.abort_all();
-                        return Err(err);
-                    }
+                    Some(Ok(out)) => out,
                     Some(Err(err)) => {
-                        set.abort_all();
-                        return Err(Error::Other(format!("업로드 작업 실패: {err}")));
+                        if first_err.is_none() {
+                            first_err = Some(Error::Other(format!("업로드 작업 실패: {err}")));
+                        }
+                        stop.cancel();
+                        stop_sent = true;
+                        continue;
+                    }
+                };
+                match result {
+                    Ok(()) => {
+                        resume.done.insert(job.rel.clone());
+                        uploaded.fetch_add(1, Ordering::SeqCst);
+                    }
+                    Err(Error::Conflict(_)) if skip_on_conflict => {
+                        // 이미 있는 객체는 완료로 간주해 재개 때 재시도하지 않는다.
+                        resume.done.insert(job.rel.clone());
+                        skipped.fetch_add(1, Ordering::SeqCst);
+                    }
+                    Err(e) => {
+                        if let Some(state) = part_state {
+                            resume.in_progress.insert(job.rel.clone(), state);
+                        }
+                        if first_err.is_none() {
+                            first_err = Some(e);
+                        }
+                        stop.cancel();
+                        stop_sent = true;
+                        continue;
                     }
                 }
+                let now = files_done.fetch_add(1, Ordering::SeqCst) + 1;
+                progress.on_files(now, files_total);
             }
         }
     }
-    let done: u64 = slots.iter().map(|s| s.load(Ordering::SeqCst)).sum();
+    let done: u64 = slots.iter().map(|s| s.load(Ordering::SeqCst)).sum::<u64>() + baseline_bytes;
     progress.on_progress(done, total_bytes);
+    if let Some(err) = first_err {
+        return Err(err);
+    }
+    if cancel.is_cancelled() {
+        return Err(cancelled_error());
+    }
     Ok(FolderUpload {
         uploaded: uploaded.load(Ordering::SeqCst),
         ignored,

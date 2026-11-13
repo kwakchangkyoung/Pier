@@ -115,7 +115,26 @@ extension FileTableView {
             }
         }
 
-        /// Return/⌘⌫ 키 핸들러를 BrowserTableView에 연결한다.
+        /// "Presigned URL 복사" 하위 메뉴. representedObject에 만료 초가 들어 있다.
+        @objc func copyPresigned(_ sender: NSMenuItem) {
+            guard let seconds = sender.representedObject as? UInt64 else { return }
+            let selected = selectedEntries()
+            guard selected.count == 1, let entry = selected.first, !entry.isDir else { return }
+            MainActor.assumeIsolated {
+                parent.onPresign(entry, seconds)
+            }
+        }
+
+        /// "정보 보기". 단일 파일에서만 동작한다.
+        @objc func showInfo(_ sender: Any?) {
+            let selected = selectedEntries()
+            guard selected.count == 1, let entry = selected.first, !entry.isDir else { return }
+            MainActor.assumeIsolated {
+                parent.onShowInfo(entry)
+            }
+        }
+
+        /// Return/⌘⌫/스페이스바 키 핸들러를 BrowserTableView에 연결한다.
         func installKeyHandlers(on tableView: BrowserTableView) {
             tableView.onReturnKey = { [weak self] in
                 self?.renameSelected(nil)
@@ -123,15 +142,41 @@ extension FileTableView {
             tableView.onDeleteKey = { [weak self] in
                 self?.deleteSelected(nil)
             }
+            tableView.onSpaceKey = { [weak self] in
+                guard let self else { return }
+                MainActor.assumeIsolated {
+                    self.parent.onQuickLook()
+                }
+            }
         }
 
         func menuNeedsUpdate(_ menu: NSMenu) {
+            // Finder 관례: 선택 밖의 행을 우클릭하면 그 행을 먼저 선택한다.
+            if let tableView, tableView.clickedRow >= 0,
+                !tableView.selectedRowIndexes.contains(tableView.clickedRow)
+            {
+                tableView.selectRowIndexes(
+                    IndexSet(integer: tableView.clickedRow), byExtendingSelection: false)
+            }
             let selected = selectedEntries()
             let hasSelection = !selected.isEmpty
-            // 메뉴 순서: 다운로드 / 구분선 / 이름 변경 / 삭제
-            menu.items[safe: 0]?.isEnabled = hasSelection
-            menu.items[safe: 2]?.isEnabled = parent.canWrite && selected.count == 1
-            menu.items[safe: 3]?.isEnabled = parent.canWrite && hasSelection
+            // presign·정보 보기는 파일 하나가 선택됐을 때만 동작한다.
+            let singleFile = selected.count == 1 && selected.first?.isDir == false
+            menuItem(.download, in: menu)?.isEnabled = hasSelection
+            let presign = menuItem(.presign, in: menu)
+            presign?.isEnabled = singleFile
+            // 하위 메뉴는 자동 검증을 끄고(autoenablesItems=false) 부모와 같은
+            // 상태로 명시 지정한다.
+            for sub in presign?.submenu?.items ?? [] {
+                sub.isEnabled = singleFile
+            }
+            menuItem(.info, in: menu)?.isEnabled = singleFile
+            menuItem(.rename, in: menu)?.isEnabled = parent.canWrite && selected.count == 1
+            menuItem(.delete, in: menu)?.isEnabled = parent.canWrite && hasSelection
+        }
+
+        private func menuItem(_ tag: FileTableView.MenuTag, in menu: NSMenu) -> NSMenuItem? {
+            menu.items.first { $0.tag == tag.rawValue }
         }
 
         private func selectedEntries() -> [PierEntry] {
@@ -206,18 +251,9 @@ extension FileTableView {
                     textField.stringValue = "—"
                 }
                 cell.toolTip = nil
-            case FileTableView.ColumnID.storageClass.rawValue:
-                textField.stringValue = entry.storageClass ?? "—"
-                cell.toolTip = nil
             default:
                 break
             }
         }
-    }
-}
-
-extension Array where Element == NSMenuItem {
-    fileprivate subscript(safe index: Int) -> NSMenuItem? {
-        indices.contains(index) ? self[index] : nil
     }
 }

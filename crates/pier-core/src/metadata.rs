@@ -15,7 +15,8 @@ use crate::item::Item;
 use crate::key;
 
 /// 스키마 버전. `PRAGMA user_version`에 기록한다.
-const SCHEMA_VERSION: i64 = 1;
+/// 1: items/folders/state/pending_ops, 2: pending_uploads.
+const SCHEMA_VERSION: i64 = 2;
 
 /// 폴더 단위 목록 상태.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -366,7 +367,49 @@ impl MetadataStore {
         Ok(ops)
     }
 
-    /// `PRAGMA user_version` 기반 마이그레이션. 0 → 1.
+    /// 중단된 멀티파트 업로드를 기록한다. 같은 upload_id가 이미 있으면
+    /// 키·시각을 갱신한다.
+    pub fn add_pending_upload(
+        &mut self,
+        upload_id: &str,
+        key: &str,
+        now_ms: i64,
+    ) -> Result<(), Error> {
+        self.conn.execute(
+            "INSERT INTO pending_uploads (upload_id, key, created_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(upload_id) DO UPDATE SET
+                key = excluded.key,
+                created_at = excluded.created_at",
+            params![upload_id, key, now_ms],
+        )?;
+        Ok(())
+    }
+
+    /// 멀티파트 업로드 기록을 지운다. 완료·abort 후 호출한다.
+    /// 없는 id는 아무 일도 하지 않는다.
+    pub fn remove_pending_upload(&mut self, upload_id: &str) -> Result<(), Error> {
+        self.conn.execute(
+            "DELETE FROM pending_uploads WHERE upload_id = ?1",
+            params![upload_id],
+        )?;
+        Ok(())
+    }
+
+    /// 남아 있는 멀티파트 업로드의 (upload_id, key, created_at) 목록을
+    /// 등록 순서로 반환한다. 연결을 열 때 서버 측 abort 정리에 쓴다.
+    pub fn pending_uploads(&self) -> Result<Vec<(String, String, i64)>, Error> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT upload_id, key, created_at FROM pending_uploads ORDER BY rowid")?;
+        let rows = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+            .collect::<Result<Vec<(String, String, i64)>, _>>()?;
+        Ok(rows)
+    }
+
+    /// `PRAGMA user_version` 기반 마이그레이션. 버전별로 필요한 DDL만
+    /// 순서대로 실행한다.
     fn migrate(&mut self) -> Result<(), Error> {
         let version: i64 = self
             .conn
@@ -375,35 +418,48 @@ impl MetadataStore {
             return Ok(());
         }
         let tx = self.conn.transaction()?;
-        tx.execute_batch(
-            "CREATE TABLE items (
-                key TEXT PRIMARY KEY,
-                parent TEXT NOT NULL,
-                is_dir INTEGER NOT NULL,
-                size INTEGER NOT NULL,
-                etag TEXT,
-                last_modified INTEGER,
-                storage_class TEXT,
-                seen_at INTEGER NOT NULL
-            );
-            CREATE INDEX items_parent ON items(parent);
-            CREATE TABLE folders (
-                prefix TEXT PRIMARY KEY,
-                last_listed_at INTEGER,
-                last_opened_at INTEGER,
-                complete INTEGER NOT NULL DEFAULT 0
-            );
-            CREATE TABLE state (
-                name TEXT PRIMARY KEY,
-                value TEXT
-            );
-            CREATE TABLE pending_ops (
-                id INTEGER PRIMARY KEY,
-                kind TEXT NOT NULL,
-                payload TEXT NOT NULL,
-                created_at INTEGER NOT NULL
-            );",
-        )?;
+        if version < 1 {
+            tx.execute_batch(
+                "CREATE TABLE items (
+                    key TEXT PRIMARY KEY,
+                    parent TEXT NOT NULL,
+                    is_dir INTEGER NOT NULL,
+                    size INTEGER NOT NULL,
+                    etag TEXT,
+                    last_modified INTEGER,
+                    storage_class TEXT,
+                    seen_at INTEGER NOT NULL
+                );
+                CREATE INDEX items_parent ON items(parent);
+                CREATE TABLE folders (
+                    prefix TEXT PRIMARY KEY,
+                    last_listed_at INTEGER,
+                    last_opened_at INTEGER,
+                    complete INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE TABLE state (
+                    name TEXT PRIMARY KEY,
+                    value TEXT
+                );
+                CREATE TABLE pending_ops (
+                    id INTEGER PRIMARY KEY,
+                    kind TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    created_at INTEGER NOT NULL
+                );",
+            )?;
+        }
+        if version < 2 {
+            // 이어올리기가 중단된 멀티파트 업로드. 다음 실행 때 서버 측
+            // abort 정리 대상이다(파트 상태 자체는 메모리에만 둔다).
+            tx.execute_batch(
+                "CREATE TABLE pending_uploads (
+                    upload_id TEXT PRIMARY KEY,
+                    key TEXT NOT NULL,
+                    created_at INTEGER NOT NULL
+                );",
+            )?;
+        }
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         tx.commit()?;
         Ok(())
@@ -505,7 +561,7 @@ mod tests {
     }
 
     #[test]
-    fn migration_sets_user_version_to_one() {
+    fn migration_sets_user_version_to_latest() {
         let store = MetadataStore::open_in_memory().unwrap();
         let version: i64 = store
             .conn
@@ -1059,5 +1115,87 @@ mod tests {
 
         store.remove_pending_op(id2).unwrap();
         assert!(store.pending_ops().unwrap().is_empty());
+    }
+
+    #[test]
+    fn pending_uploads_crud_and_order() {
+        let mut store = MetadataStore::open_in_memory().unwrap();
+        assert!(store.pending_uploads().unwrap().is_empty());
+
+        store.add_pending_upload("up-1", "docs/a.bin", 100).unwrap();
+        store.add_pending_upload("up-2", "docs/b.bin", 200).unwrap();
+
+        let rows = store.pending_uploads().unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                ("up-1".to_string(), "docs/a.bin".to_string(), 100),
+                ("up-2".to_string(), "docs/b.bin".to_string(), 200),
+            ]
+        );
+
+        // 같은 upload_id는 갱신되고 행이 늘지 않는다.
+        store.add_pending_upload("up-1", "docs/c.bin", 300).unwrap();
+        let rows = store.pending_uploads().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].0, "up-1");
+        assert_eq!(rows[0].1, "docs/c.bin");
+        assert_eq!(rows[0].2, 300);
+
+        store.remove_pending_upload("up-1").unwrap();
+        let rows = store.pending_uploads().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, "up-2");
+
+        // 없는 id 삭제는 무시된다.
+        store.remove_pending_upload("nope").unwrap();
+        store.remove_pending_upload("up-2").unwrap();
+        assert!(store.pending_uploads().unwrap().is_empty());
+    }
+
+    #[test]
+    fn migration_upgrades_v1_to_v2() {
+        let dir = temp_dir("v1tov2");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("metadata.sqlite");
+
+        // 스키마 1 상태의 DB를 직접 만든다(기존 사용자 파일을 흉내낸다).
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE items (
+                    key TEXT PRIMARY KEY,
+                    parent TEXT NOT NULL,
+                    is_dir INTEGER NOT NULL,
+                    size INTEGER NOT NULL,
+                    etag TEXT,
+                    last_modified INTEGER,
+                    storage_class TEXT,
+                    seen_at INTEGER NOT NULL
+                );
+                CREATE TABLE pending_ops (
+                    id INTEGER PRIMARY KEY,
+                    kind TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    created_at INTEGER NOT NULL
+                );
+                PRAGMA user_version = 1;",
+            )
+            .unwrap();
+        }
+
+        // 다시 열면 v2로 올라가고 pending_uploads가 생긴다.
+        let mut store = MetadataStore::open(&path).unwrap();
+        let version: i64 = store
+            .conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        store.add_pending_upload("up-9", "k", 1).unwrap();
+        assert_eq!(store.pending_uploads().unwrap().len(), 1);
+        drop(store);
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

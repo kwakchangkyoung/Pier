@@ -19,6 +19,24 @@ enum PierErrorPresenter {
         return "알 수 없는 오류가 발생했습니다."
     }
 
+    /// 대기열 작업 오류(PierJobError)를 사용자 메시지로 변환한다.
+    static func message(forJobError error: PierJobError) -> String {
+        switch error.kind {
+        case .authentication:
+            return "인증에 실패했습니다. Access Key ID와 Secret Access Key를 확인하세요."
+        case .network:
+            return "네트워크에 연결할 수 없습니다. 네트워크 연결을 확인하고 다시 시도하세요."
+        case .notFound:
+            return "항목을 찾을 수 없습니다. 이미 삭제되었을 수 있으니 목록을 새로고침하세요."
+        case .conflict:
+            return "다른 곳에서 변경되었습니다."
+        case .cancelled:
+            return "전송이 취소되었습니다."
+        case .other:
+            return error.message.isEmpty ? "오류가 발생했습니다." : "오류가 발생했습니다: \(error.message)"
+        }
+    }
+
     /// 로그용 분류값. 에러 본문은 시크릿이 섞일 수 있어 남기지 않는다.
     static func categoryName(of error: Error) -> String {
         guard let pierError = error as? PierError else { return "unknown" }

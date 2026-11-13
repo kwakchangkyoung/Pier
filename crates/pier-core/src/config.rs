@@ -1,6 +1,7 @@
 use crate::error::Error;
+use crate::transfer::TransferOptions;
 
-/// 서비스 프리셋 종류. Phase 0에서는 식별용 열거형만 둔다.
+/// 서비스 종류. 프리셋과 1:1로 대응한다.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Provider {
     Aws,
@@ -8,6 +9,182 @@ pub enum Provider {
     Wasabi,
     MinIO,
     Custom,
+}
+
+/// 서비스 프리셋 (SPEC 4.1). FFI의 PierPreset에 대응한다.
+///
+/// `needs_endpoint`/`needs_account_id`는 연결 설정 창이 어떤 입력을
+/// 보여줄지 결정하는 힌트이고, `chunk_size_mb`/`concurrency`는
+/// `transfer_options`의 기본값이다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Preset {
+    pub id: &'static str,
+    pub display_name: &'static str,
+    /// 이 프리셋이 기본값을 제공하는 Provider. 둘은 1:1로 대응한다.
+    pub provider: Provider,
+    /// true면 사용자가 엔드포인트를 직접 입력해야 한다.
+    pub needs_endpoint: bool,
+    /// true면 엔드포인트 생성에 계정 ID가 필요하다(R2).
+    pub needs_account_id: bool,
+    pub default_region: &'static str,
+    /// 선택지로 보여줄 리전 목록. 비어 있으면 자유 입력이다.
+    pub regions: &'static [&'static str],
+    pub path_style: bool,
+    /// 전송 청크 크기 기본값(MB).
+    pub chunk_size_mb: u32,
+    /// 동시 전송 수 기본값.
+    pub concurrency: u32,
+}
+
+const AWS_REGIONS: &[&str] = &[
+    "us-east-1",
+    "us-east-2",
+    "us-west-1",
+    "us-west-2",
+    "ca-central-1",
+    "eu-west-1",
+    "eu-west-2",
+    "eu-west-3",
+    "eu-central-1",
+    "eu-north-1",
+    "eu-south-1",
+    "ap-northeast-1",
+    "ap-northeast-2",
+    "ap-northeast-3",
+    "ap-southeast-1",
+    "ap-southeast-2",
+    "ap-south-1",
+    "sa-east-1",
+    "af-south-1",
+    "me-south-1",
+    "me-central-1",
+];
+
+const WASABI_REGIONS: &[&str] = &[
+    "us-east-1",
+    "us-east-2",
+    "us-central-1",
+    "us-west-1",
+    "us-west-2",
+    "ca-central-1",
+    "eu-central-1",
+    "eu-central-2",
+    "eu-west-1",
+    "eu-west-2",
+    "eu-west-3",
+    "eu-north-1",
+    "ap-northeast-1",
+    "ap-northeast-2",
+    "ap-southeast-1",
+    "ap-southeast-2",
+];
+
+/// 서비스별 프리셋. 배열 순서가 UI에 보이는 순서다.
+const PRESETS: &[Preset] = &[
+    Preset {
+        id: "aws",
+        display_name: "Amazon S3",
+        provider: Provider::Aws,
+        needs_endpoint: false,
+        needs_account_id: false,
+        default_region: "us-east-1",
+        regions: AWS_REGIONS,
+        path_style: false,
+        chunk_size_mb: 8,
+        concurrency: 8,
+    },
+    Preset {
+        id: "r2",
+        display_name: "Cloudflare R2",
+        provider: Provider::R2,
+        needs_endpoint: false,
+        needs_account_id: true,
+        default_region: "auto",
+        regions: &["auto"],
+        // R2는 가상 호스트 방식을 지원하고 path-style은 지원하지 않는다.
+        path_style: false,
+        chunk_size_mb: 8,
+        concurrency: 8,
+    },
+    Preset {
+        id: "wasabi",
+        display_name: "Wasabi",
+        provider: Provider::Wasabi,
+        needs_endpoint: false,
+        needs_account_id: false,
+        default_region: "us-east-1",
+        regions: WASABI_REGIONS,
+        path_style: false,
+        chunk_size_mb: 8,
+        concurrency: 8,
+    },
+    Preset {
+        id: "minio",
+        display_name: "MinIO",
+        provider: Provider::MinIO,
+        needs_endpoint: true,
+        needs_account_id: false,
+        default_region: "us-east-1",
+        regions: &["us-east-1"],
+        path_style: true,
+        chunk_size_mb: 8,
+        concurrency: 8,
+    },
+    Preset {
+        id: "custom",
+        display_name: "S3 호환 (커스텀)",
+        provider: Provider::Custom,
+        needs_endpoint: true,
+        needs_account_id: false,
+        default_region: "us-east-1",
+        regions: &[],
+        // 자체 호스팅을 포함한 임의 엔드포인트에는 path-style이
+        // 안전한 기본값이다. 필요하면 연결 설정에서 바꿀 수 있다.
+        path_style: true,
+        chunk_size_mb: 8,
+        concurrency: 8,
+    },
+];
+
+/// 모든 프리셋을 표시 순서대로 반환한다.
+pub fn presets() -> &'static [Preset] {
+    PRESETS
+}
+
+/// Provider에 해당하는 프리셋을 반환한다. 둘은 1:1로 대응한다.
+pub fn preset_for(provider: Provider) -> &'static Preset {
+    PRESETS
+        .iter()
+        .find(|p| p.provider == provider)
+        .expect("모든 Provider에는 프리셋이 있다")
+}
+
+/// 프리셋과 입력으로 엔드포인트를 만든다.
+///
+/// 엔드포인트가 없거나(AWS) 사용자가 직접 입력하는 경우(MinIO·커스텀)에는
+/// None을 반환한다. R2는 계정 ID, Wasabi는 리전이 필요하며 입력 형식이
+/// 맞지 않아도 None이다.
+pub fn preset_endpoint(preset_id: &str, account_id: Option<&str>, region: &str) -> Option<String> {
+    let preset = PRESETS.iter().find(|p| p.id == preset_id)?;
+    match preset.provider {
+        Provider::R2 => {
+            let account_id = account_id?;
+            valid_r2_account_id(account_id)
+                .then(|| format!("https://{account_id}.r2.cloudflarestorage.com"))
+        }
+        Provider::Wasabi => {
+            let valid = region
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+            (!region.is_empty() && valid).then(|| format!("https://s3.{region}.wasabisys.com"))
+        }
+        _ => None,
+    }
+}
+
+/// R2 계정 ID는 32자 영숫자다.
+fn valid_r2_account_id(account_id: &str) -> bool {
+    account_id.len() == 32 && account_id.bytes().all(|b| b.is_ascii_alphanumeric())
 }
 
 /// SPEC 4.1의 연결 설정.
@@ -23,6 +200,10 @@ pub struct ConnectionConfig {
     pub prefix: Option<String>,
     pub path_style: bool,
     pub access_key_id: String,
+    /// 전송 청크 크기(MB). None이면 프리셋 기본값을 쓴다.
+    pub chunk_size_mb: Option<u32>,
+    /// 동시 전송 수. None이면 프리셋 기본값을 쓴다.
+    pub concurrency: Option<u32>,
 }
 
 impl ConnectionConfig {
@@ -44,6 +225,23 @@ impl ConnectionConfig {
             return Err(Error::Other("Access Key ID가 비어 있습니다".to_string()));
         }
         Ok(())
+    }
+
+    /// 이 연결의 전송 옵션 (SPEC 4.4).
+    ///
+    /// 설정이 없으면 프리셋 기본값을 쓰고, 청크 5~512MB·동시성 1~32
+    /// 범위로 클램프한다.
+    pub fn transfer_options(&self) -> TransferOptions {
+        let preset = preset_for(self.provider);
+        let chunk_mb = self
+            .chunk_size_mb
+            .unwrap_or(preset.chunk_size_mb)
+            .clamp(5, 512);
+        let concurrency = self.concurrency.unwrap_or(preset.concurrency).clamp(1, 32);
+        TransferOptions {
+            chunk_size: u64::from(chunk_mb) * 1024 * 1024,
+            concurrency: concurrency as usize,
+        }
     }
 }
 
@@ -118,6 +316,8 @@ mod tests {
             prefix: None,
             path_style: false,
             access_key_id: "AKIAEXAMPLE".to_string(),
+            chunk_size_mb: None,
+            concurrency: None,
         }
     }
 
@@ -184,5 +384,80 @@ mod tests {
         let mut config = valid_config();
         config.access_key_id = String::new();
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn presets_cover_every_provider() {
+        assert_eq!(presets().len(), 5);
+        for provider in [
+            Provider::Aws,
+            Provider::R2,
+            Provider::Wasabi,
+            Provider::MinIO,
+            Provider::Custom,
+        ] {
+            let preset = preset_for(provider);
+            assert_eq!(preset.provider, provider);
+            assert!(presets().iter().any(|p| p.id == preset.id));
+        }
+    }
+
+    #[test]
+    fn preset_flags() {
+        let get = |id: &str| presets().iter().find(|p| p.id == id).unwrap();
+        assert!(!get("aws").needs_endpoint);
+        assert!(!get("aws").needs_account_id);
+        assert!(get("r2").needs_account_id);
+        assert!(!get("r2").needs_endpoint);
+        assert_eq!(get("r2").default_region, "auto");
+        assert!(get("minio").needs_endpoint);
+        assert!(get("minio").path_style);
+        assert!(get("custom").needs_endpoint);
+    }
+
+    #[test]
+    fn preset_endpoint_cases() {
+        // R2: 유효한 32자 영숫자 계정 ID로 만든다.
+        let account = "a1".repeat(16);
+        assert_eq!(
+            preset_endpoint("r2", Some(&account), "auto").as_deref(),
+            Some(format!("https://{account}.r2.cloudflarestorage.com").as_str())
+        );
+        // 계정 ID가 없거나 형식이 틀리면 None.
+        assert!(preset_endpoint("r2", None, "auto").is_none());
+        assert!(preset_endpoint("r2", Some("short"), "auto").is_none());
+        assert!(preset_endpoint("r2", Some(&"!".repeat(32)), "auto").is_none());
+        // Wasabi: 리전에서 생성한다.
+        assert_eq!(
+            preset_endpoint("wasabi", None, "eu-west-1").as_deref(),
+            Some("https://s3.eu-west-1.wasabisys.com")
+        );
+        assert!(preset_endpoint("wasabi", None, "").is_none());
+        // AWS·MinIO·커스텀은 자동 생성 엔드포인트가 없다.
+        assert!(preset_endpoint("aws", None, "us-east-1").is_none());
+        assert!(preset_endpoint("minio", None, "us-east-1").is_none());
+        assert!(preset_endpoint("없는id", None, "x").is_none());
+    }
+
+    #[test]
+    fn transfer_options_defaults_and_clamps() {
+        let mut config = valid_config();
+        // 설정이 없으면 AWS 프리셋 기본값(8MB 청크, 동시성 8).
+        let opts = config.transfer_options();
+        assert_eq!(opts.chunk_size, 8 * 1024 * 1024);
+        assert_eq!(opts.concurrency, 8);
+
+        // 범위 밖 값은 클램프된다.
+        config.chunk_size_mb = Some(1);
+        config.concurrency = Some(0);
+        let opts = config.transfer_options();
+        assert_eq!(opts.chunk_size, 5 * 1024 * 1024);
+        assert_eq!(opts.concurrency, 1);
+
+        config.chunk_size_mb = Some(9999);
+        config.concurrency = Some(99);
+        let opts = config.transfer_options();
+        assert_eq!(opts.chunk_size, 512 * 1024 * 1024);
+        assert_eq!(opts.concurrency, 32);
     }
 }

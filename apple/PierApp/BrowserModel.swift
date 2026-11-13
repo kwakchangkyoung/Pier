@@ -38,6 +38,8 @@ final class BrowserModel {
     private let connectionProvider: () throws -> PierConnection
     private var loadTask: Task<Void, Never>?
     private var refreshTask: Task<Void, Never>?
+    /// 현재 폴더 하위 목록 프리페치 작업. 폴더를 떠나면 취소한다.
+    private var prefetchTask: Task<Void, Never>?
     private var didStart = false
     /// 백그라운드 refresh 세대 번호. 취소된 이전 작업이 플래그를 건드리지 않게 한다.
     private var refreshGeneration = 0
@@ -123,6 +125,7 @@ final class BrowserModel {
     private func cancelTasks() {
         loadTask?.cancel()
         refreshTask?.cancel()
+        prefetchTask?.cancel()
         refreshGeneration += 1
         isRefreshing = false
     }
@@ -180,6 +183,7 @@ final class BrowserModel {
             items.sort { $0.identifier < $1.identifier }
             entries = items
             phase = .ready
+            startPrefetch(folder: folder, connection: conn)
             if firstPageFromCache {
                 startRefresh(folder: folder, connection: conn)
             }
@@ -189,6 +193,24 @@ final class BrowserModel {
             guard !Task.isCancelled else { return }
             if let message = PierErrorPresenter.message(for: error) {
                 phase = .failed(message)
+            }
+        }
+    }
+
+    /// 목록 표시 직후 하위 폴더를 백그라운드로 미리 읽어 둔다(Phase 4 프리페치).
+    /// 폴더를 떠나면 cancelTasks가 이 작업을 취소한다. 실패는 조용히 무시한다.
+    private func startPrefetch(folder: String, connection conn: PierConnection) {
+        prefetchTask?.cancel()
+        prefetchTask = Task {
+            do {
+                let prefetched = try await conn.prefetch(folder: folder)
+                if prefetched > 0 {
+                    Log.app.debug("prefetch 완료: \(prefetched)개 폴더")
+                }
+            } catch {
+                if !Task.isCancelled {
+                    Log.app.error("prefetch 실패: \(PierErrorPresenter.categoryName(of: error))")
+                }
             }
         }
     }

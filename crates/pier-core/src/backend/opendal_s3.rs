@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 use std::path::Path;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use opendal::options::WriteOptions;
 use opendal::services::S3;
@@ -243,6 +243,25 @@ impl Backend for OpendalS3 {
             )
             .await
         }
+    }
+
+    async fn presign_read(&self, key: &str, expires: Duration) -> Result<String, Error> {
+        // S3 presigned URL의 최대 만료는 7일(604,800초)이다.
+        const MAX_EXPIRE: Duration = Duration::from_secs(604_800);
+        if expires.is_zero() || expires > MAX_EXPIRE {
+            return Err(Error::Other(format!(
+                "presign 만료는 1~604800초여야 한다: {}초",
+                expires.as_secs()
+            )));
+        }
+        let req = self
+            .operator
+            .presign_read(key, expires)
+            .await
+            .map_err(|e| Error::from_opendal(e, "presign", key))?;
+        // URL 전체(서명 포함)는 로그에 남기지 않는다(SPEC 4.6).
+        log::info!("presigned URL을 만들었다 (만료 {}초)", expires.as_secs());
+        Ok(req.uri().to_string())
     }
 }
 
@@ -505,6 +524,8 @@ mod tests {
             prefix: None,
             path_style,
             access_key_id: "AKIAEXAMPLE".to_string(),
+            chunk_size_mb: None,
+            concurrency: None,
         }
     }
 

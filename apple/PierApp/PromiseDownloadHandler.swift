@@ -10,6 +10,7 @@ import AppKit
 final class PromiseDownloadHandler: NSObject, NSFilePromiseProviderDelegate {
     private let entry: PierEntry
     private let connection: PierConnection
+    private let connectionId: UUID
     private let transfers: TransferManager
     /// writePromiseToURL이 완료됐는지. 세션 종료 시 정리 기준으로 쓴다.
     private(set) var didFinish = false
@@ -17,9 +18,15 @@ final class PromiseDownloadHandler: NSObject, NSFilePromiseProviderDelegate {
     /// 프로바이더가 요구하는 파일 타입. 폴더는 public.folder여야 한다.
     private let fileType: String
 
-    init(entry: PierEntry, connection: PierConnection, transfers: TransferManager) {
+    init(
+        entry: PierEntry,
+        connection: PierConnection,
+        connectionId: UUID,
+        transfers: TransferManager
+    ) {
         self.entry = entry
         self.connection = connection
+        self.connectionId = connectionId
         self.transfers = transfers
         self.fileType = entry.isDir ? "public.folder" : "public.data"
         super.init()
@@ -39,7 +46,7 @@ final class PromiseDownloadHandler: NSObject, NSFilePromiseProviderDelegate {
         entry.name
     }
 
-    /// 드롭 위치 URL로 다운로드한다. 폴더는 downloadFolder가 destDir 안에
+    /// 드롭 위치 URL로 다운로드한다. 폴더는 enqueueDownloadFolder가 destDir 안에
     /// '<폴더 이름>'을 만들기 때문에 TransferManager가 임시 디렉터리 경유로 옮긴다.
     nonisolated func filePromiseProvider(
         _ filePromiseProvider: NSFilePromiseProvider,
@@ -49,6 +56,7 @@ final class PromiseDownloadHandler: NSObject, NSFilePromiseProviderDelegate {
         Task { @MainActor in
             self.transfers.startPromiseDownload(
                 connection: self.connection,
+                connectionId: self.connectionId,
                 entry: self.entry,
                 destination: url
             ) { error in

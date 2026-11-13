@@ -13,11 +13,13 @@ final class UploadController {
     private var conflictContinuation: CheckedContinuation<TransferConflictChoice?, Never>?
 
     /// NSOpenPanel/Finder 드롭으로 온 항목들을 parent 폴더에 업로드한다.
-    /// 파일은 upload, 폴더는 uploadFolder를 사용한다. 완료 시 onFinished에 결과를 넘긴다.
+    /// 파일은 enqueueUpload, 폴더는 enqueueUploadFolder를 사용한다.
+    /// 완료 시 onFinished에 결과를 넘긴다.
     func start(
         urls: [URL],
         parent: String,
         connection: PierConnection,
+        connectionId: UUID,
         transfers: TransferManager,
         onFinished: @escaping @MainActor (PierEntry?) -> Void
     ) {
@@ -28,8 +30,9 @@ final class UploadController {
             for (url, mode) in zip(urls, modes) {
                 guard let mode else { continue }
                 if Self.isDirectory(url) {
-                    transfers.uploadFolder(
+                    transfers.enqueueUploadFolder(
                         connection: connection,
+                        connectionId: connectionId,
                         source: url,
                         parent: parent,
                         mode: mode,
@@ -37,8 +40,9 @@ final class UploadController {
                         conflictHandler: conflictHandler
                     )
                 } else {
-                    transfers.uploadFile(
+                    transfers.enqueueUpload(
                         connection: connection,
+                        connectionId: connectionId,
                         source: url,
                         parent: parent,
                         name: url.lastPathComponent,

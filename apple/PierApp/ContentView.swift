@@ -76,11 +76,11 @@ struct ContentView: View {
         store.connections.isEmpty ? "연결이 없습니다" : "연결을 선택하세요"
     }
 
-    private func iconName(for provider: SavedConnection.ProviderKind) -> String {
+    private func iconName(for provider: String) -> String {
         switch provider {
-        case .aws: return "cloud"
-        case .minio: return "shippingbox"
-        case .custom: return "globe"
+        case "minio": return "shippingbox"
+        case "custom": return "globe"
+        default: return "cloud"
         }
     }
 

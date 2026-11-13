@@ -36,6 +36,8 @@ fn minio_config() -> ConnectionConfig {
         prefix: None,
         path_style: true,
         access_key_id: "minioadmin".to_string(),
+        chunk_size_mb: None,
+        concurrency: None,
     }
 }
 

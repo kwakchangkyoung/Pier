@@ -4,7 +4,7 @@
 
 S3 호환 버킷을 탐색하고 파일을 주고받는 macOS 독립 앱을 만든다. 일반 창 앱(Dock에 표시)과 메뉴바 아이콘을 함께 제공한다. Cyberduck, Transmit 같은 GUI 클라이언트, CloudMounter/Mountain Duck 같은 마운트 앱, rclone 같은 CLI와 비교해 다음으로 차별화한다.
 
-- **메인 창**: 사이드바(연결 목록) + 파일 테이블(이름, 크기, 수정 시각, 스토리지 클래스) + 경로 표시줄(breadcrumb) + 툴바(새로고침, 업로드, 새 폴더, 다운로드).
+- **메인 창**: 사이드바(연결 목록) + 파일 테이블(이름, 크기, 수정 시각) + 경로 표시줄(breadcrumb) + 툴바(새로고침, 업로드, 새 폴더, 다운로드).
 - **메뉴바**: 진행 중인 전송과 속도, 연결 목록에서 창 열기, 현재 폴더 새로고침, 설정 열기.
 - **무료·오픈소스**이면서 **설정 없이 빠른** 앱: 서비스별 최적 전송 설정을 프리셋으로 기본 제공한다.
 - **체감 속도**: 한 번 열어본 폴더는 캐시에서 즉시 표시하고 백그라운드에서 갱신한다. 대용량 파일은 병렬 범위 다운로드·멀티파트 업로드로 대역폭을 채운다.
@@ -124,6 +124,14 @@ pub struct ConnectionConfig {
 
 프리셋은 서비스별 엔드포인트 형식, 기본 리전, path-style 여부, 권장 청크 크기·동시성을 담는다. 예: R2는 `https://<account_id>.r2.cloudflarestorage.com`, 리전 `auto`.
 
+| 프리셋 | 엔드포인트 | 추가 입력 | 기본 리전 | path-style | 청크/동시성 |
+|---|---|---|---|---|---|
+| AWS S3 | 없음 (입력 불필요) | 없음 | us-east-1 | 아니오 | 8MB / 8 |
+| Cloudflare R2 | `https://<account_id>.r2.cloudflarestorage.com` | 계정 ID | auto | 아니오 | 8MB / 8 |
+| Wasabi | `https://s3.<region>.wasabisys.com` | 없음 | us-east-1 | 아니오 | 8MB / 8 |
+| MinIO | 사용자 입력 | 없음 | us-east-1 | 예 | 8MB / 8 |
+| 커스텀 | 사용자 입력 | 없음 | us-east-1 | 예 | 8MB / 8 |
+
 ### 4.2 메타데이터 캐시 (SQLite)
 
 - 위치: `~/Library/Caches/com.yourname.pier/connections/<connection_id>/metadata.sqlite`. 캐시이므로 삭제돼도 복구 가능하다. WAL 모드.
@@ -163,7 +171,7 @@ pub struct ConnectionConfig {
 
 ### 4.6 로깅
 
-`tracing`을 사용하고, FFI 층에서 macOS 통합 로그(os_log)로 내보낸다. 키, 시크릿, presigned URL 전체 값은 로그에 남기지 않는다.
+`log` 파사드를 사용하고, FFI 층이 코어 로그를 콜백으로 받아 macOS 통합 로그(os_log)로 내보낸다. 키, 시크릿, presigned URL 전체 값은 로그에 남기지 않는다.
 
 ## 5. FFI 설계 (`pier-ffi`)
 
@@ -185,15 +193,28 @@ pub struct ConnectionConfig {
 | `rename(key, newParent, newName)` | 이동·이름 변경 |
 | `delete(key)` | 삭제 |
 | `resumePendingOps()` | 중단된 폴더 이름 변경 이어서 완료, 처리 건수 반환 |
-| `presign(key, expiresSecs)` | presigned GET URL |
+| `presign(key, expiresSecs)` | presigned GET URL (최대 7일) |
+| `presets()` | 서비스 프리셋 목록 (4.1) |
+| `presetEndpoint(presetId, accountId?, region)` | 프리셋·입력으로 엔드포인트 생성. 직접 입력이 필요하거나 형식이 맞지 않으면 `nil` |
+| `setLogSink(sink)` | 코어 로그를 받는 싱크 설치. 프로세스당 한 번, Info 이상만 전달 |
+| `enqueueDownload(key, destPath)` / `enqueueDownloadFolder(prefix, destDir)` | 다운로드 작업을 대기열에 넣고 작업 id 반환 |
+| `enqueueUpload(srcPath, parent, name, mode)` / `enqueueUploadFolder(srcDir, parent, mode)` | 업로드 작업을 대기열에 넣고 작업 id 반환 |
+| `pauseJob` / `resumeJob` / `cancelJob` / `retryJob` / `removeJob` (id) | 대기열 작업 제어 (동기, 없는 id는 무시) |
+| `jobs()` | 모든 작업 스냅샷을 id 순(FIFO)으로 반환 |
+| `setJobListener(listener)` | 작업 변화 통지 콜백 등록. 작업당 100ms 스로틀, 상태 변화는 즉시 |
+| `info(key)` | 객체 정보(메타데이터 + 스토리지 클래스) |
+| `prefetch(folder)` | 최근 목록의 하위 폴더를 미리 캐시(최대 20개, 동시성 2) |
+| `preview(key, progress, cancel)` | 로컬 미리보기 파일 경로 반환 (연결 캐시 디렉터리/previews, ETag 재사용, 1GB LRU) |
 
+- `PierConfig`는 `provider`(프리셋 id)·`chunkSizeMb`·`concurrency`를 포함해 연결 전송 옵션을 결정한다.
 - Rust 타입은 UniFFI Record/Enum으로 노출하고, Swift 쪽 뷰 모델로 감싸는 변환은 `PierApp`에서 한다.
+- 코어가 호출하는 외부 콜백은 `PierJobListener`, `PierLogSink`, `PierProgress`의 세 가지 외부 트레이트다. 모두 백그라운드 스레드에서 호출된다.
 
 ## 6. macOS 앱 설계
 
 ### 6.1 메인 창과 연결 관리
 
-- **메인 창:** 사이드바에 연결 목록, 본문에 파일 테이블(이름, 크기, 수정 시각, 스토리지 클래스), 경로 표시줄(breadcrumb), 툴바(새로고침, 업로드, 새 폴더, 다운로드). 폴더 더블클릭으로 진입하고 뒤로/앞으로 이동을 지원한다.
+- **메인 창:** 사이드바에 연결 목록, 본문에 파일 테이블(이름, 크기, 수정 시각), 경로 표시줄(breadcrumb), 툴바(새로고침, 업로드, 새 폴더, 다운로드). 폴더 더블클릭으로 진입하고 뒤로/앞으로 이동을 지원한다.
 - **연결 관리 설정 창:** 연결 추가·편집·삭제. 프리셋 선택 → 필요한 필드만 표시 → "연결 테스트" 성공 시에만 저장. 시크릿은 로그인 키체인(`kSecClassGenericPassword`, service `com.yourname.pier`, account = connection id)에 저장하고, 설정은 `~/Library/Application Support/com.yourname.pier/connections.json`에 저장한다. 연결 삭제 시 키체인 항목과 캐시까지 삭제한다.
 
 ### 6.2 메뉴바 (`MenuBarExtra`)
@@ -213,7 +234,7 @@ pub struct ConnectionConfig {
 ### 6.5 우클릭 메뉴
 
 - "Presigned URL 복사" (만료 1시간 / 1일 / 7일)
-- "정보 보기" (키, 크기, ETag, 스토리지 클래스, 최종 수정 시각)
+- "정보 보기" (키, 크기, ETag, 최종 수정 시각; 스토리지 클래스는 HEAD 요청으로 가져온다)
 - "다운로드", "이름 변경", "삭제"
 
 ## 알려진 제약
@@ -221,6 +242,7 @@ pub struct ConnectionConfig {
 - ad-hoc 서명 앱은 빌드할 때마다 코드 서명이 달라져, 개발 중 재빌드 후 키체인 접근 허용 대화상자가 다시 뜰 수 있다 (배포본은 한 번 허용하면 유지된다).
 - App Sandbox를 쓰지 않는다.
 - 객체가 매우 많은 폴더(수만 개 이상)는 첫 화면 표시가 전체 목록 수신 시간만큼 걸린다.
+- 전송 대기열은 앱 종료 시 사라지고, 미완료 멀티파트 업로드는 다음 실행 때 정리된다.
 
 ## 7. 단계별 작업 계획
 

@@ -22,6 +22,9 @@ final class PierSessions {
     /// 사이드바/메뉴에서 선택된 연결 id.
     var selectedId: UUID?
 
+    /// 대기열 집계자. 앱 시작 시 한 번 연결하면 이후 열리는 연결에 리스너를 단다.
+    var transfers: TransferManager?
+
     /// 현재 선택된 연결의 브라우저. 없으면 nil.
     var activeBrowser: BrowserModel? {
         guard let selectedId else { return nil }
@@ -47,6 +50,7 @@ final class PierSessions {
         connections.removeValue(forKey: record.id)
         openedRecords.removeValue(forKey: record.id)
         browsers.removeValue(forKey: record.id)
+        transfers?.unregister(connectionId: record.id)
         if selectedId == record.id {
             browsers[record.id] = makeBrowser(record)
             browsers[record.id]?.activate()
@@ -58,6 +62,7 @@ final class PierSessions {
         browsers.removeValue(forKey: id)
         connections.removeValue(forKey: id)
         openedRecords.removeValue(forKey: id)
+        transfers?.unregister(connectionId: id)
         if selectedId == id {
             selectedId = nil
         }
@@ -95,6 +100,7 @@ final class PierSessions {
         )
         connections[record.id] = connection
         openedRecords[record.id] = record
+        transfers?.register(connection: connection, connectionId: record.id)
         return connection
     }
 }

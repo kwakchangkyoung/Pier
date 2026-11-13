@@ -23,6 +23,12 @@ struct FileTableView: NSViewRepresentable {
     let onMoveKeys: @MainActor ([String], String) -> Void
     /// Finder 파일 드롭: 로컬 URL들을 toParent 폴더로 업로드한다.
     let onUploadURLs: @MainActor ([URL], String) -> Void
+    /// 우클릭 "Presigned URL 복사": 항목과 만료 초를 넘긴다.
+    let onPresign: @MainActor (PierEntry, UInt64) -> Void
+    /// 우클릭 "정보 보기".
+    let onShowInfo: @MainActor (PierEntry) -> Void
+    /// 스페이스바 Quick Look 요청.
+    let onQuickLook: @MainActor () -> Void
     /// 행을 Finder로 끌 때 파일 프로미스 핸들러를 만든다. nil이면 드래그 불가.
     let makePromiseHandler: @MainActor (PierEntry) -> PromiseDownloadHandler?
 
@@ -61,10 +67,20 @@ struct FileTableView: NSViewRepresentable {
         tableView.registerForDraggedTypes([PierDragTypes.entryKeys, .fileURL])
 
         let menu = NSMenu()
-        menu.addItem(menuItem("다운로드", #selector(Coordinator.downloadSelected(_:)), target: context.coordinator))
+        let coordinator = context.coordinator
+        // 활성화는 menuNeedsUpdate가 수동으로 정한다. 자동 검증(autoenablesItems)은
+        // "Presigned URL 복사"처럼 action이 없는 하위 메뉴 부모를 항상 비활성으로 만든다.
+        menu.autoenablesItems = false
+        menu.addItem(
+            menuItem("다운로드", #selector(Coordinator.downloadSelected(_:)), target: coordinator, tag: .download))
+        menu.addItem(presignMenuItem(target: coordinator))
+        menu.addItem(
+            menuItem("정보 보기", #selector(Coordinator.showInfo(_:)), target: coordinator, tag: .info))
         menu.addItem(.separator())
-        menu.addItem(menuItem("이름 변경", #selector(Coordinator.renameSelected(_:)), target: context.coordinator))
-        menu.addItem(menuItem("삭제", #selector(Coordinator.deleteSelected(_:)), target: context.coordinator))
+        menu.addItem(
+            menuItem("이름 변경", #selector(Coordinator.renameSelected(_:)), target: coordinator, tag: .rename))
+        menu.addItem(
+            menuItem("삭제", #selector(Coordinator.deleteSelected(_:)), target: coordinator, tag: .delete))
         menu.delegate = context.coordinator
         tableView.menu = menu
 
@@ -87,7 +103,6 @@ struct FileTableView: NSViewRepresentable {
         case name
         case size
         case modified
-        case storageClass
     }
 
     private static func makeColumns() -> [NSTableColumn] {
@@ -102,13 +117,45 @@ struct FileTableView: NSViewRepresentable {
             column(.name, "이름", 320),
             column(.size, "크기", 90),
             column(.modified, "수정 시각", 170),
-            column(.storageClass, "클래스", 120),
         ]
     }
 
-    private func menuItem(_ title: String, _ action: Selector, target: Coordinator) -> NSMenuItem {
+    /// 우클릭 메뉴 항목 구분 태그. menuNeedsUpdate에서 인덱스 대신 태그로 찾는다.
+    enum MenuTag: Int {
+        case download = 1
+        case presign
+        case info
+        case rename
+        case delete
+    }
+
+    private func menuItem(
+        _ title: String, _ action: Selector, target: Coordinator, tag: MenuTag
+    ) -> NSMenuItem {
         let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
         item.target = target
+        item.tag = tag.rawValue
+        return item
+    }
+
+    /// "Presigned URL 복사" 하위 메뉴. 만료 선택지는 1시간/1일/7일(최대)이다.
+    private func presignMenuItem(target: Coordinator) -> NSMenuItem {
+        let item = NSMenuItem(title: "Presigned URL 복사", action: nil, keyEquivalent: "")
+        item.tag = MenuTag.presign.rawValue
+        let submenu = NSMenu()
+        // 하위 항목의 활성화도 부모 menuNeedsUpdate 결과에 맡긴다.
+        submenu.autoenablesItems = false
+        for (title, seconds) in [("1시간", UInt64(3600)), ("1일", UInt64(86400)), ("7일", UInt64(604800))] {
+            let sub = NSMenuItem(
+                title: title,
+                action: #selector(Coordinator.copyPresigned(_:)),
+                keyEquivalent: ""
+            )
+            sub.target = target
+            sub.representedObject = seconds
+            submenu.addItem(sub)
+        }
+        item.submenu = submenu
         return item
     }
 }

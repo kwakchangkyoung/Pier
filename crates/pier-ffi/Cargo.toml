@@ -9,6 +9,7 @@ name = "pier_ffi"
 crate-type = ["staticlib", "cdylib", "lib"]
 
 [dependencies]
+log = "0.4"
 pier-core = { path = "../pier-core" }
 tokio = { version = "1.54.1", features = ["rt-multi-thread"] }
 uniffi = { version = "0.32.2", features = ["tokio", "cli"] }

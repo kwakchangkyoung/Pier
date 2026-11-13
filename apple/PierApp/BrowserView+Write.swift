@@ -54,6 +54,12 @@ extension BrowserView {
                 Label("다운로드", systemImage: "arrow.down.to.line")
             }
             .disabled(!canDownload)
+            Button {
+                transfers.panelExpanded.toggle()
+            } label: {
+                Label("전송", systemImage: "arrow.up.arrow.down")
+            }
+            .keyboardShortcut("l", modifiers: [.option, .command])
         }
     }
 
@@ -86,7 +92,12 @@ extension BrowserView {
     /// 행을 Finder로 끌 때 앱→Finder 다운로드용 프로미스 핸들러를 만든다.
     func makePromiseHandler(for entry: PierEntry) -> PromiseDownloadHandler? {
         guard let connection = model.connection else { return nil }
-        return PromiseDownloadHandler(entry: entry, connection: connection, transfers: transfers)
+        return PromiseDownloadHandler(
+            entry: entry,
+            connection: connection,
+            connectionId: model.connectionId,
+            transfers: transfers
+        )
     }
 
     /// 툴바 업로드: 파일·폴더 다중 선택 후 현재 폴더에 올린다.
@@ -104,8 +115,68 @@ extension BrowserView {
     /// 로컬 URL들을 parent 폴더에 업로드한다. 충돌 확인·모드 결정은 UploadController가 한다.
     func startUploads(_ urls: [URL], parent: String) {
         guard let connection = model.connection else { return }
-        uploads.start(urls: urls, parent: parent, connection: connection, transfers: transfers) { entry in
+        uploads.start(
+            urls: urls,
+            parent: parent,
+            connection: connection,
+            connectionId: model.connectionId,
+            transfers: transfers
+        ) { entry in
             model.noteRemoteChange(entry: entry)
+        }
+    }
+
+    // MARK: - Quick Look / presign / 정보 보기
+
+    /// 스페이스바 미리보기. 선택 중 첫 번째 파일을 대상으로 한다(폴더는 무시).
+    func quickLookSelection() {
+        guard let entry = selectedEntries.first(where: { !$0.isDir }),
+            let connection = model.connection
+        else { return }
+        preview.toggle(entry: entry, connection: connection)
+    }
+
+    /// presigned URL을 만들어 클립보드에 복사한다. 서명이 든 URL이므로 로그에 남기지 않는다.
+    func copyPresignedURL(entry: PierEntry, expiresSecs: UInt64) {
+        guard let connection = model.connection else { return }
+        Task {
+            do {
+                let url = try await connection.presign(
+                    key: entry.identifier, expiresSecs: expiresSecs)
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(url, forType: .string)
+                showToast("복사됨")
+            } catch {
+                actionError =
+                    PierErrorPresenter.message(for: error) ?? "URL을 만들지 못했습니다."
+            }
+        }
+    }
+
+    /// 객체 정보를 받아 시트로 연다.
+    func showObjectInfo(entry: PierEntry) {
+        guard let connection = model.connection else { return }
+        Task {
+            do {
+                objectInfo = ObjectInfoSheetData(
+                    info: try await connection.info(key: entry.identifier))
+            } catch {
+                actionError =
+                    PierErrorPresenter.message(for: error) ?? "정보를 가져오지 못했습니다."
+            }
+        }
+    }
+
+    /// 짧은 토스트를 띄운다. 같은 메시지가 다시 뜨면 타이머만 연장한다.
+    func showToast(_ message: String) {
+        toastMessage = message
+        toastGeneration += 1
+        let generation = toastGeneration
+        Task { @MainActor in
+            try? await Task.sleep(for: .seconds(1.5))
+            if toastGeneration == generation {
+                toastMessage = nil
+            }
         }
     }
 

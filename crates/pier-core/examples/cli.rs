@@ -1,10 +1,11 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use pier_core::config::{ConnectionConfig, Provider};
 use pier_core::enumerate::Connection;
 use pier_core::transfer::{self, CancelToken, ProgressSink, TransferOptions, UploadMode};
-use pier_core::{Item, OpendalS3};
+use pier_core::{Backend, Item, OpendalS3, S3Raw};
 
 fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
@@ -21,6 +22,8 @@ fn minio_config() -> ConnectionConfig {
         prefix: None,
         path_style: env_or("PIER_PATH_STYLE", "true") == "true",
         access_key_id: env_or("PIER_ACCESS_KEY", "minioadmin"),
+        chunk_size_mb: None,
+        concurrency: None,
     }
 }
 
@@ -134,6 +137,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("size: {}", item.size);
             println!("etag: {:?}", item.etag);
             println!("last_modified_ms: {:?}", item.last_modified_ms);
+            Ok(())
+        }
+        Some("info") => {
+            let key = args.get(2).ok_or("사용법: cli info <key>")?;
+            let item = conn.stat(key).await?;
+            // 스토리지 클래스는 목록에 안 나오므로 HEAD로 따로 가져온다.
+            let raw = S3Raw::new(&minio_config(), &secret)?;
+            let storage_class = raw.head_storage_class(key).await?;
+            println!("key: {}", item.key);
+            println!("size: {}", item.size);
+            println!("etag: {:?}", item.etag);
+            println!("storage_class: {storage_class}");
+            println!("last_modified_ms: {:?}", item.last_modified_ms);
+            Ok(())
+        }
+        Some("presign") => {
+            let key = args.get(2).ok_or("사용법: cli presign <key> [초]")?;
+            let secs = match args.get(3) {
+                Some(s) => s.parse::<u64>().map_err(|_| "만료 초는 숫자여야 한다")?,
+                None => 3600,
+            };
+            // URL은 사용자가 요청한 출력이라 stdout에 찍는다 — 로그에는
+            // 남기지 않는다(SPEC 4.6).
+            let url = conn
+                .backend()
+                .presign_read(key, Duration::from_secs(secs))
+                .await?;
+            println!("{url}");
             Ok(())
         }
         Some("get") => {
@@ -302,7 +333,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(())
         }
         _ => {
-            eprintln!("사용법: cli ls [폴더] | cli refresh [폴더] | cli stat <key> | cli get <key> <dest> | cli get-dir <prefix> <dest_dir> | cli put <src> <parent> [--keep-both|--replace] | cli put-dir <src_dir> <parent> [--keep-both|--replace] | cli mkdir <parent> <name> | cli mv <key> <new_parent> <new_name> | cli rm <key>");
+            eprintln!("사용법: cli ls [폴더] | cli refresh [폴더] | cli stat <key> | cli info <key> | cli presign <key> [초(기본 3600)] | cli get <key> <dest> | cli get-dir <prefix> <dest_dir> | cli put <src> <parent> [--keep-both|--replace] | cli put-dir <src_dir> <parent> [--keep-both|--replace] | cli mkdir <parent> <name> | cli mv <key> <new_parent> <new_name> | cli rm <key>");
             std::process::exit(2);
         }
     }

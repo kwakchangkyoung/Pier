@@ -1,6 +1,7 @@
 import SwiftUI
 
 /// 연결 추가·편집 폼. draft/secret 상태는 SettingsView가 소유한다.
+/// 서비스 선택은 코어의 presets()를 기준으로 한다.
 struct ConnectionFormView: View {
     @Binding var draft: SavedConnection
     @Binding var secret: String
@@ -17,6 +18,11 @@ struct ConnectionFormView: View {
         ConnectionValidation.errors(draft: draft, secret: secret, isEditing: isEditing)
     }
 
+    /// 현재 선택된 프리셋. 알 수 없는 provider id면 nil.
+    private var preset: PierPreset? {
+        draft.preset
+    }
+
     var body: some View {
         Form {
             Section("연결") {
@@ -25,21 +31,16 @@ struct ConnectionFormView: View {
                     fieldError(.displayName)
                 }
                 Picker("서비스", selection: $draft.provider) {
-                    ForEach(SavedConnection.ProviderKind.allCases, id: \.self) { provider in
-                        Text(provider.label).tag(provider)
+                    ForEach(presets(), id: \.id) { preset in
+                        Text(preset.displayName).tag(preset.id)
+                    }
+                    // 저장된 값이 프리셋에 없는 구형 데이터면 그대로 보여준다.
+                    if preset == nil {
+                        Text(draft.providerLabel).tag(draft.provider)
                     }
                 }
-                if draft.provider != .aws {
-                    VStack(alignment: .leading, spacing: 2) {
-                        TextField("엔드포인트 (예: http://127.0.0.1:9000)", text: endpointBinding)
-                        fieldError(.endpoint)
-                    }
-                    Toggle("Path-style 사용", isOn: $draft.pathStyle)
-                }
-                VStack(alignment: .leading, spacing: 2) {
-                    TextField("리전", text: $draft.region)
-                    fieldError(.region)
-                }
+                serviceFields
+                regionField
                 VStack(alignment: .leading, spacing: 2) {
                     TextField("버킷 이름 (예: my-bucket)", text: $draft.bucket)
                     bucketGuide
@@ -61,6 +62,7 @@ struct ConnectionFormView: View {
                         .foregroundStyle(.secondary)
                 }
             }
+            TransferSettingsSection(draft: $draft, preset: preset)
             Section {
                 HStack(spacing: 8) {
                     Button("연결 테스트") { onTest() }
@@ -87,9 +89,71 @@ struct ConnectionFormView: View {
         }
         .formStyle(.grouped)
         .onChange(of: draft.provider) {
-            draft.applyProviderDefaults()
+            draft.applyPresetDefaults()
         }
     }
+
+    // MARK: - 프리셋별 필드
+
+    /// 계정 ID(엔드포인트 자동 계산) 또는 직접 엔드포인트 입력 필드.
+    @ViewBuilder
+    private var serviceFields: some View {
+        if let preset, preset.needsAccountId {
+            VStack(alignment: .leading, spacing: 2) {
+                TextField("계정 ID", text: accountIdBinding)
+                fieldError(.accountId)
+            }
+            LabeledContent("엔드포인트") {
+                Text(computedEndpoint ?? "계정 ID를 입력하면 자동으로 정해집니다")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+        }
+        if preset?.needsEndpoint ?? true {
+            VStack(alignment: .leading, spacing: 2) {
+                TextField("엔드포인트 (예: http://127.0.0.1:9000)", text: endpointBinding)
+                fieldError(.endpoint)
+            }
+            Toggle("Path-style 사용", isOn: $draft.pathStyle)
+        }
+    }
+
+    /// 프리셋의 리전 선택지에 따라 Picker 또는 텍스트 필드를 보여준다.
+    /// 리전이 하나뿐이면(예: R2 "auto") 필드를 숨긴다.
+    @ViewBuilder
+    private var regionField: some View {
+        if let preset, !preset.regions.isEmpty {
+            if preset.regions.count > 1 {
+                Picker("리전", selection: $draft.region) {
+                    ForEach(preset.regions, id: \.self) { region in
+                        Text(region).tag(region)
+                    }
+                    if !preset.regions.contains(draft.region) {
+                        Text(draft.region).tag(draft.region)
+                    }
+                }
+            }
+        } else {
+            VStack(alignment: .leading, spacing: 2) {
+                TextField("리전", text: $draft.region)
+                fieldError(.region)
+            }
+        }
+    }
+
+    /// 계정 ID·리전으로 계산된 엔드포인트(읽기 전용 표시용).
+    private var computedEndpoint: String? {
+        guard let preset else { return nil }
+        return presetEndpoint(
+            presetId: preset.id,
+            accountId: Self.nonEmpty(draft.accountId),
+            region: draft.region
+        )
+    }
+
+    // MARK: - 공통 부분
 
     /// 필드 아래에 표시할 짧은 오류 안내.
     @ViewBuilder
@@ -137,6 +201,14 @@ struct ConnectionFormView: View {
         }
     }
 
+    /// 빈 문자열과 nil을 오가는 계정 ID 바인딩.
+    private var accountIdBinding: Binding<String> {
+        Binding(
+            get: { draft.accountId ?? "" },
+            set: { draft.accountId = $0.isEmpty ? nil : $0 }
+        )
+    }
+
     /// 빈 문자열과 nil을 오가는 엔드포인트 바인딩.
     private var endpointBinding: Binding<String> {
         Binding(
@@ -151,5 +223,11 @@ struct ConnectionFormView: View {
             get: { draft.prefix ?? "" },
             set: { draft.prefix = $0.isEmpty ? nil : $0 }
         )
+    }
+
+    private static func nonEmpty(_ value: String?) -> String? {
+        guard let value else { return nil }
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
     }
 }

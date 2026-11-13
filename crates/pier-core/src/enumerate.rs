@@ -9,8 +9,11 @@
 //! 갱신은 refresh가 원격 목록을 다시 받아 캐시를 한 트랜잭션으로 교체한다.
 
 use std::path::Path;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::SystemTime;
+
+use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
 
 use crate::backend::opendal_s3::OpendalS3;
 use crate::backend::Backend;
@@ -41,7 +44,9 @@ pub struct ListResult {
 /// 캐시 사용 여부 판단과 페이지 분할은 여기서, 네트워크는 Backend가 담당한다.
 pub struct Connection<B: Backend = OpendalS3> {
     backend: B,
-    store: Mutex<MetadataStore>,
+    /// Arc인 이유: S3Raw가 미완료 멀티파트(pending_uploads)를
+    /// 기록·정리할 때 같은 저장소를 공유한다.
+    store: Arc<Mutex<MetadataStore>>,
 }
 
 impl Connection<OpendalS3> {
@@ -53,9 +58,10 @@ impl Connection<OpendalS3> {
     ) -> Result<Self, Error> {
         let backend = OpendalS3::new(config, secret_access_key)?;
         let store = MetadataStore::open(&cache_dir.join("metadata.sqlite"))?;
+        log::info!("연결을 열었다 (provider: {:?})", config.provider);
         Ok(Self {
             backend,
-            store: Mutex::new(store),
+            store: Arc::new(Mutex::new(store)),
         })
     }
 }
@@ -65,8 +71,19 @@ impl<B: Backend> Connection<B> {
     pub fn with_backend(backend: B, store: MetadataStore) -> Self {
         Self {
             backend,
-            store: Mutex::new(store),
+            store: Arc::new(Mutex::new(store)),
         }
+    }
+
+    /// 메타데이터 캐시 저장소를 공유한다.
+    /// S3Raw의 pending_uploads 기록·정리처럼 저장소를 직접 써야 할 때 쓴다.
+    pub fn metadata_store(&self) -> Arc<Mutex<MetadataStore>> {
+        Arc::clone(&self.store)
+    }
+
+    /// 백엔드 접근자. presign처럼 캐시와 무관한 원격 호출에 쓴다.
+    pub fn backend(&self) -> &B {
+        &self.backend
     }
 
     /// prefix 폴더의 항목을 키 순으로 한 페이지 반환한다.
@@ -99,6 +116,8 @@ impl<B: Backend> Connection<B> {
             let items = self.backend.list_folder(&prefix).await?;
             let mut store = self.lock()?;
             store.replace_folder(&prefix, &items, now_ms())?;
+            // 키·시크릿은 로그에 남기지 않고 개수만 기록한다(SPEC 4.6).
+            log::info!("폴더 목록을 원격에서 받았다 (항목 {}개)", items.len());
         }
 
         // 페이지는 캐시에서 로컬로 나눈다. 다음 페이지 존재 여부를 알기 위해
@@ -129,7 +148,13 @@ impl<B: Backend> Connection<B> {
         let prefix = key::normalize_prefix(prefix);
         let items = self.backend.list_folder(&prefix).await?;
         let mut store = self.lock()?;
-        store.replace_folder(&prefix, &items, now_ms())
+        let changes = store.replace_folder(&prefix, &items, now_ms())?;
+        log::info!(
+            "폴더를 갱신했다 (추가·변경 {}개, 삭제 {}개)",
+            changes.upserted.len(),
+            changes.removed.len()
+        );
+        Ok(changes)
     }
 
     /// 원격 루트 목록을 한 번 조회해 연결·인증·버킷 접근을 확인하고,
@@ -285,6 +310,59 @@ where
             store.upsert_item(&Item::folder(prefix), now_ms())?;
         }
         Ok(result)
+    }
+
+    /// 최근 열어본 폴더의 하위 폴더 목록을 미리 캐시한다 (SPEC Phase 4).
+    ///
+    /// `prefix`의 캐시된 목록에서 하위 폴더를 골라, 캐시가 complete가 아닌
+    /// 것을 최대 `max_folders`개까지 동시 `concurrency`개로 원격에서 받아
+    /// 캐시에 넣는다. 반환값은 이번에 새로 받은 폴더 수다.
+    /// 취소는 이 future를 drop하는 것으로 한다 — JoinSet이 drop될 때
+    /// 남은 목록 태스크를 함께 중단한다.
+    pub async fn prefetch(
+        &self,
+        prefix: &str,
+        max_folders: usize,
+        concurrency: usize,
+    ) -> Result<u32, Error> {
+        let prefix = key::normalize_prefix(prefix);
+        let targets: Vec<String> = {
+            let store = self.lock()?;
+            store
+                .cached_page(&prefix, None, usize::MAX)?
+                .into_iter()
+                .filter(|item| item.is_dir)
+                .filter(|item| !matches!(store.folder_state(&item.key), Ok(Some(s)) if s.complete))
+                .map(|item| item.key)
+                .take(max_folders)
+                .collect()
+        };
+        if targets.is_empty() {
+            return Ok(0);
+        }
+
+        // 목록 요청만 concurrency로 제한하고, 캐시 반영은 모아서 순차로 한다.
+        let sem = Arc::new(Semaphore::new(concurrency.max(1)));
+        let mut tasks = JoinSet::new();
+        for key in targets {
+            let backend = self.backend.clone();
+            let sem = Arc::clone(&sem);
+            tasks.spawn(async move {
+                let _permit = sem.acquire_owned().await;
+                backend.list_folder(&key).await.map(|items| (key, items))
+            });
+        }
+
+        let mut fetched = 0u32;
+        while let Some(result) = tasks.join_next().await {
+            // JoinError는 태스크 panic/cancel뿐이다.
+            let (key, items) =
+                result.map_err(|e| Error::Other(format!("프리페치 태스크가 실패했다: {e}")))??;
+            self.lock()?.replace_folder(&key, &items, now_ms())?;
+            fetched += 1;
+        }
+        log::info!("하위 폴더 {fetched}개를 미리 캐시했다");
+        Ok(fetched)
     }
 }
 

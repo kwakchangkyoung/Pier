@@ -1228,7 +1228,13 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 name = "pier-core"
 version = "0.1.0"
 dependencies = [
+ "http",
+ "log",
  "opendal",
+ "quick-xml",
+ "reqsign-aws-v4",
+ "reqsign-core",
+ "reqwest",
  "rusqlite",
  "thiserror",
  "tokio",
@@ -1238,6 +1244,7 @@ dependencies = [
 name = "pier-ffi"
 version = "0.1.0"
 dependencies = [
+ "log",
  "pier-core",
  "tokio",
  "uniffi",
