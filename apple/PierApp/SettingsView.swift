@@ -4,7 +4,8 @@ import SwiftUI
 enum TestState: Equatable {
     case idle
     case testing
-    case succeeded
+    /// 성공. canWrite는 코어의 쓰기 권한 판정 결과다.
+    case succeeded(canWrite: Bool)
     case failed(String)
 }
 
@@ -33,7 +34,7 @@ struct SettingsView: View {
                 isEditing: editingId != nil,
                 testState: testState,
                 actionError: actionError,
-                canSave: testState == .succeeded,
+                canSave: testSucceeded,
                 onTest: { testConnection() },
                 onSave: { save() },
                 onDelete: { confirmDelete = true }
@@ -121,6 +122,12 @@ struct SettingsView: View {
         actionError = nil
     }
 
+    /// 테스트가 성공했는지 여부. canSave 조건으로 쓴다.
+    private var testSucceeded: Bool {
+        if case .succeeded = testState { return true }
+        return false
+    }
+
     // MARK: - 동작
 
     /// 임시 캐시 디렉터리로 연결을 열어 testConnection()을 호출한다.
@@ -164,8 +171,9 @@ struct SettingsView: View {
                     secretAccessKey: secretKey,
                     cacheDir: cacheDir.path
                 )
-                try await connection.testConnection()
-                testState = .succeeded
+                // 목록 조회 후 쓰기 테스트 객체를 쓰고 지워 can_write를 판정한다.
+                let result = try await connection.testConnection()
+                testState = .succeeded(canWrite: result.canWrite)
             } catch {
                 testState = .failed(PierErrorPresenter.message(for: error) ?? "연결 테스트에 실패했습니다.")
             }
@@ -175,7 +183,11 @@ struct SettingsView: View {
     private func save() {
         actionError = nil
         // 앞뒤 공백을 제거한 값으로 저장한다.
-        let cleanDraft = ConnectionValidation.sanitized(draft)
+        var cleanDraft = ConnectionValidation.sanitized(draft)
+        // 테스트에서 확인한 쓰기 권한을 함께 저장한다(읽기 전용 표시용).
+        if case .succeeded(let canWrite) = testState {
+            cleanDraft.canWrite = canWrite
+        }
         let trimmedSecret = secret.trimmingCharacters(in: .whitespacesAndNewlines)
         do {
             if let editingId {

@@ -27,6 +27,8 @@ struct SavedConnection: Codable, Identifiable, Hashable {
     var prefix: String?
     var pathStyle: Bool
     var accessKeyId: String
+    /// 연결 테스트에서 확인한 쓰기 권한. nil은 미확인(이전 버전 연결 등)으로 쓰기 허용으로 본다.
+    var canWrite: Bool?
 
     /// 아직 저장되지 않은 새 연결의 초깃값.
     static func emptyDraft() -> SavedConnection {
@@ -39,7 +41,8 @@ struct SavedConnection: Codable, Identifiable, Hashable {
             bucket: "",
             prefix: nil,
             pathStyle: false,
-            accessKeyId: ""
+            accessKeyId: "",
+            canWrite: nil
         )
     }
 

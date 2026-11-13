@@ -46,6 +46,31 @@ pub fn child_key(parent: &str, name: &str, is_dir: bool) -> String {
     key
 }
 
+/// taken에 없는 이름을 고른다. `name`이 taken에 없으면 그대로,
+/// 있으면 `이름 (2)`, `이름 (3)`… 순으로 처음 비어 있는 이름을 반환한다.
+///
+/// 확장자 규칙은 하나로 통일한다: 마지막 '.' 뒤를 확장자로 보고
+/// `archive.tar.gz` → `archive.tar (2).gz`가 된다. 단, '.'이 첫 글자면
+/// (`.hidden`) 확장자가 아닌 이름의 일부로 본다. 폴더 이름은 보통
+/// 확장자가 없으므로 `폴더 (2)` 형태가 자연스럽게 나온다.
+pub fn available_name(taken: &std::collections::HashSet<String>, name: &str) -> String {
+    if !taken.contains(name) {
+        return name.to_string();
+    }
+    // 마지막 '.'이 이름 첫 글자가 아니면 그 뒤를 확장자로 본다.
+    let (stem, ext) = match name.rfind('.') {
+        Some(i) if i > 0 => (&name[..i], &name[i..]),
+        _ => (name, ""),
+    };
+    for n in 2u32.. {
+        let candidate = format!("{stem} ({n}){ext}");
+        if !taken.contains(&candidate) {
+            return candidate;
+        }
+    }
+    unreachable!()
+}
+
 /// 접두사를 정규화한다: 앞의 '/'를 제거하고, 비어 있지 않으면 끝에 '/'를 보장한다.
 ///
 /// - `"photos"` → `"photos/"`
@@ -125,6 +150,31 @@ mod tests {
         assert_eq!(child_key("photos/", "2024", true), "photos/2024/");
         assert_eq!(child_key("", "사진", true), "사진/");
         assert_eq!(child_key("a//", "b.txt", false), "a//b.txt");
+    }
+
+    #[test]
+    fn available_name_cases() {
+        use std::collections::HashSet;
+        let taken: HashSet<String> = ["a.txt", "a (2).txt", "b", "c (2)"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        // 비어 있으면 그대로.
+        assert_eq!(available_name(&taken, "new.txt"), "new.txt");
+        // 첫 충돌부터 (2), 이미 있으면 (3).
+        assert_eq!(available_name(&taken, "a.txt"), "a (3).txt");
+        // 확장자 없는 이름.
+        assert_eq!(available_name(&taken, "b"), "b (2)");
+        assert_eq!(available_name(&taken, "c (2)"), "c (2) (2)");
+        // 마지막 '.'만 확장자로 본다.
+        let taken2: HashSet<String> = ["archive.tar.gz"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(
+            available_name(&taken2, "archive.tar.gz"),
+            "archive.tar (2).gz"
+        );
+        // 선행 '.'은 확장자가 아니다.
+        let taken3: HashSet<String> = [".hidden"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(available_name(&taken3, ".hidden"), ".hidden (2)");
     }
 
     #[test]

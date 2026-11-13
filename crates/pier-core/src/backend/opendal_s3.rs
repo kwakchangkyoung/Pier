@@ -1,13 +1,16 @@
 use std::collections::HashSet;
+use std::path::Path;
 use std::time::SystemTime;
 
+use opendal::options::WriteOptions;
 use opendal::services::S3;
-use opendal::{EntryMode, Metadata, Operator};
+use opendal::{EntryMode, Metadata, Operator, Writer};
 
-use crate::backend::Backend;
+use crate::backend::{Backend, PutOptions, WriteCondition};
 use crate::config::ConnectionConfig;
 use crate::error::Error;
 use crate::item::Item;
+use crate::transfer::{CancelToken, ProgressSink};
 
 /// OpenDAL 기반 S3 백엔드.
 /// Operator는 내부가 Arc라 clone이 저렴하며, 병렬 다운로드가 청크별
@@ -46,6 +49,52 @@ impl OpendalS3 {
 
         let operator = Operator::new(builder)?;
         Ok(Self { operator })
+    }
+
+    /// WriteCondition을 OpenDAL WriteOptions로 변환한다.
+    /// 백엔드가 조건부 쓰기를 지원하지 않으면(capability) 쓰기 직전
+    /// stat으로 조건을 확인하는 폴백을 둔다(SPEC 3.4).
+    async fn condition_options(
+        &self,
+        key: &str,
+        condition: &WriteCondition,
+    ) -> Result<WriteOptions, Error> {
+        let cap = self.operator.info().capability();
+        let mut opts = WriteOptions::default();
+        match condition {
+            WriteCondition::Any => {}
+            WriteCondition::NotExists => {
+                if cap.write_with_if_not_exists {
+                    opts.if_not_exists = true;
+                } else {
+                    match self.operator.stat(key).await {
+                        Ok(_) => {
+                            return Err(Error::Conflict(format!("{key}가 이미 존재한다")));
+                        }
+                        Err(e) if e.kind() == opendal::ErrorKind::NotFound => {}
+                        Err(e) => return Err(Error::from_opendal(e, "stat", key)),
+                    }
+                }
+            }
+            WriteCondition::IfMatch(etag) => {
+                if cap.write_with_if_match {
+                    opts.if_match = Some(etag.clone());
+                } else {
+                    match self.operator.stat(key).await {
+                        Ok(meta) => {
+                            if meta.etag() != Some(etag.as_str()) {
+                                return Err(Error::Conflict(format!("{key}의 ETag가 다르다")));
+                            }
+                        }
+                        Err(e) if e.kind() == opendal::ErrorKind::NotFound => {
+                            return Err(Error::Conflict(format!("{key}가 없다")));
+                        }
+                        Err(e) => return Err(Error::from_opendal(e, "stat", key)),
+                    }
+                }
+            }
+        }
+        Ok(opts)
     }
 }
 
@@ -118,6 +167,83 @@ impl Backend for OpendalS3 {
             .map_err(|e| Error::from_opendal(e, "read", key))?;
         Ok(buf.to_vec())
     }
+
+    async fn create_dir(&self, key: &str) -> Result<(), Error> {
+        // S3는 네이티브 create_dir이 없지만 Operator::new에 기본 적용된
+        // SimulateLayer가 0바이트 `key/` 객체 쓰기로 흉내낸다.
+        self.operator
+            .create_dir(key)
+            .await
+            .map_err(|e| Error::from_opendal(e, "mkdir", key))
+    }
+
+    async fn copy(&self, from: &str, to: &str) -> Result<(), Error> {
+        // OpenDAL copy는 크기에 따라 서버 측 단일/멀티파트 복사를 자동 선택한다.
+        self.operator
+            .copy(from, to)
+            .await
+            .map_err(|e| Error::from_opendal(e, "copy", from))?;
+        Ok(())
+    }
+
+    async fn delete_keys(&self, keys: &[String]) -> Result<(), Error> {
+        // Deleter가 S3 DeleteObjects 기준 요청당 최대 1,000개로 배치한다.
+        self.operator
+            .delete_iter(keys.to_vec())
+            .await
+            .map_err(|e| Error::from_opendal(e, "delete", ""))
+    }
+
+    async fn write_bytes(&self, key: &str, data: Vec<u8>) -> Result<(), Error> {
+        self.operator
+            .write(key, data)
+            .await
+            .map_err(|e| Error::from_opendal(e, "write", key))?;
+        Ok(())
+    }
+
+    async fn put_file(
+        &self,
+        key: &str,
+        src: &Path,
+        opts: PutOptions,
+        progress: &dyn ProgressSink,
+        cancel: &CancelToken,
+    ) -> Result<(), Error> {
+        let mut file = tokio::fs::File::open(src).await?;
+        let size = file.metadata().await?.len();
+        if cancel.is_cancelled() {
+            return Err(cancelled_error());
+        }
+        progress.on_progress(0, size);
+
+        let mut wopts = self.condition_options(key, &opts.condition).await?;
+        if size <= opts.part_size {
+            put_single(
+                &self.operator,
+                key,
+                &mut file,
+                size,
+                wopts,
+                progress,
+                cancel,
+            )
+            .await
+        } else {
+            wopts.chunk = Some(opts.part_size as usize);
+            wopts.concurrent = opts.concurrency.max(1);
+            put_multipart(
+                &self.operator,
+                key,
+                &mut file,
+                size,
+                wopts,
+                progress,
+                cancel,
+            )
+            .await
+        }
+    }
 }
 
 /// opendal 목록 엔트리를 Item으로 변환한다.
@@ -168,6 +294,199 @@ fn last_modified_ms(meta: &Metadata) -> Option<i64> {
             .map(|d| d.as_millis() as i64)
             .unwrap_or_default()
     })
+}
+
+fn cancelled_error() -> Error {
+    Error::Cancelled("업로드가 취소됐다".to_string())
+}
+
+/// 취소·실패 시 원격에 객체를 남기지 않기 위해 부분 객체를 지운다.
+async fn delete_quietly(operator: &Operator, key: &str) {
+    let _ = operator.delete(key).await;
+}
+
+/// 단일 PUT 업로드. 파일 전체를 메모리에 읽는다(≤ part_size ≤ 수십 MB).
+async fn put_single(
+    operator: &Operator,
+    key: &str,
+    file: &mut tokio::fs::File,
+    size: u64,
+    wopts: WriteOptions,
+    progress: &dyn ProgressSink,
+    cancel: &CancelToken,
+) -> Result<(), Error> {
+    use tokio::io::AsyncReadExt;
+    let mut data = Vec::with_capacity(size as usize);
+    file.read_to_end(&mut data).await.map_err(Error::from)?;
+    if cancel.is_cancelled() {
+        return Err(cancelled_error());
+    }
+    // 요청이 서버에 도달한 뒤 취소될 수 있으므로, 쓰기 future를
+    // 취소와 select로 묶고 취소가 이기면 부분 객체를 지운다.
+    let result = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => {
+            delete_quietly(operator, key).await;
+            return Err(cancelled_error());
+        }
+        r = operator.write_options(key, data, wopts) => r,
+    };
+    match result {
+        Ok(_) => {
+            if cancel.is_cancelled() {
+                // complete 응답 수신과 취소가 경주했을 수 있다.
+                delete_quietly(operator, key).await;
+                return Err(cancelled_error());
+            }
+            progress.on_progress(size, size);
+            Ok(())
+        }
+        Err(e) => Err(Error::from_opendal(e, "write", key)),
+    }
+}
+
+/// 멀티파트 업로드. part_size 크기로 파일을 나눠 쓰고 close로 완결한다.
+/// 어떤 경로로 끝나든(성공·실패·취소·호출 측 future drop) 미완료
+/// 멀티파트가 남지 않게 WriterGuard가 abort를 보장한다.
+async fn put_multipart(
+    operator: &Operator,
+    key: &str,
+    file: &mut tokio::fs::File,
+    size: u64,
+    wopts: WriteOptions,
+    progress: &dyn ProgressSink,
+    cancel: &CancelToken,
+) -> Result<(), Error> {
+    let part_size = wopts.chunk.unwrap_or(16 * 1024 * 1024) as u64;
+    let mut writer = match operator.writer_options(key, wopts).await {
+        Ok(w) => WriterGuard::new(w),
+        Err(e) => return Err(Error::from_opendal(e, "write", key)),
+    };
+
+    let mut submitted = 0u64;
+    let feed_result: Result<(), Error> = async {
+        loop {
+            if cancel.is_cancelled() {
+                return Err(cancelled_error());
+            }
+            let mut part = vec![0u8; part_size as usize];
+            let n = read_part(file, &mut part).await?;
+            if n == 0 {
+                break;
+            }
+            part.truncate(n);
+            writer
+                .write(part)
+                .await
+                .map_err(|e| Error::from_opendal(e, "write", key))?;
+            submitted += n as u64;
+            progress.on_progress(submitted, size);
+        }
+        Ok(())
+    }
+    .await;
+    if let Err(e) = feed_result {
+        let _ = writer.abort().await;
+        return Err(e);
+    }
+
+    // close도 complete 요청과 경주할 수 있으므로 취소와 select로 묶는다.
+    let closed = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => {
+            let _ = writer.abort().await;
+            delete_quietly(operator, key).await;
+            return Err(cancelled_error());
+        }
+        r = writer.close() => r,
+    };
+    match closed {
+        Ok(_) => {
+            if cancel.is_cancelled() {
+                delete_quietly(operator, key).await;
+                return Err(cancelled_error());
+            }
+            writer.disarm();
+            progress.on_progress(size, size);
+            Ok(())
+        }
+        Err(e) => {
+            let _ = writer.abort().await;
+            Err(Error::from_opendal(e, "write", key))
+        }
+    }
+}
+
+/// 파일에서 최대 buf.len() 바이트를 읽는다. 파일 끝이면 더 짧게 반환한다.
+async fn read_part(file: &mut tokio::fs::File, buf: &mut [u8]) -> std::io::Result<usize> {
+    use tokio::io::AsyncReadExt;
+    let mut filled = 0;
+    while filled < buf.len() {
+        let n = file.read(&mut buf[filled..]).await?;
+        if n == 0 {
+            break;
+        }
+        filled += n;
+    }
+    Ok(filled)
+}
+
+/// Writer를 close/abort 없이 버려질 때(호출 측 future drop, 태스크 abort)
+/// 멀티파트 업로드를 정리하는 가드. 명시적 abort/disarm 후에는 아무것도
+/// 하지 않는다.
+struct WriterGuard {
+    inner: Option<Writer>,
+}
+
+impl WriterGuard {
+    fn new(writer: Writer) -> Self {
+        Self {
+            inner: Some(writer),
+        }
+    }
+
+    async fn write(&mut self, bs: Vec<u8>) -> opendal::Result<()> {
+        self.inner
+            .as_mut()
+            .expect("writer는 abort 후에 쓸 수 없다")
+            .write(bs)
+            .await
+    }
+
+    async fn close(&mut self) -> opendal::Result<Metadata> {
+        self.inner
+            .as_mut()
+            .expect("writer는 abort 후에 닫을 수 없다")
+            .close()
+            .await
+    }
+
+    async fn abort(&mut self) -> opendal::Result<()> {
+        match self.inner.take() {
+            Some(mut w) => w.abort().await,
+            None => Ok(()),
+        }
+    }
+
+    /// close 성공 후 호출. 이후 drop돼도 abort하지 않는다.
+    fn disarm(&mut self) {
+        self.inner = None;
+    }
+}
+
+impl Drop for WriterGuard {
+    fn drop(&mut self) {
+        if let Some(mut writer) = self.inner.take() {
+            // 런타임이 살아 있으면 abort를 백그라운드로 보낸다.
+            // 태스크 abort 등으로 이미 종료 중이면 best-effort로 포기한다
+            // (이 경우 서버 측 MPU 수명주기 규칙이 최종 정리를 맡는다).
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async move {
+                    let _ = writer.abort().await;
+                });
+            }
+        }
+    }
 }
 
 #[cfg(test)]

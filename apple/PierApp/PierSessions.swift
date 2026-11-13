@@ -6,6 +6,8 @@ enum PierSessionError: Error {
     case unavailable
     /// 저장된 연결 설정이 FFI `PierConfig`로 변환되지 않는 경우.
     case invalidConfiguration
+    /// 폴더/항목 이름이 비어 있거나 '/'를 포함하는 경우.
+    case invalidName
 }
 
 /// `PierConnection` 인스턴스와 연결별 `BrowserModel`을 관리한다.
@@ -62,7 +64,12 @@ final class PierSessions {
     }
 
     private func makeBrowser(_ record: SavedConnection) -> BrowserModel {
-        BrowserModel(connectionId: record.id, title: record.displayName) { [weak self] in
+        // canWrite가 nil(이전 버전 연결)이면 쓰기 허용으로 본다.
+        BrowserModel(
+            connectionId: record.id,
+            title: record.displayName,
+            canWrite: record.canWrite != false
+        ) { [weak self] in
             guard let self else { throw PierSessionError.unavailable }
             return try self.pierConnection(for: record)
         }

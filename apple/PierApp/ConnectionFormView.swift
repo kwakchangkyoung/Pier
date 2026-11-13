@@ -122,10 +122,13 @@ struct ConnectionFormView: View {
             EmptyView()
         case .testing:
             EmptyView()
-        case .succeeded:
-            Label("테스트 성공", systemImage: "checkmark.circle.fill")
-                .font(.caption)
-                .foregroundStyle(.green)
+        case .succeeded(let canWrite):
+            Label(
+                canWrite ? "테스트 성공" : "테스트 성공 — 읽기 전용 연결",
+                systemImage: canWrite ? "checkmark.circle.fill" : "eye.fill"
+            )
+            .font(.caption)
+            .foregroundStyle(canWrite ? .green : .orange)
         case .failed(let message):
             Text(message)
                 .font(.caption)

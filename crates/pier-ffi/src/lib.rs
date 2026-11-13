@@ -4,7 +4,10 @@ use std::sync::Arc;
 use pier_core::config::{ConnectionConfig, Provider};
 use pier_core::enumerate::Connection as CoreConnection;
 use pier_core::item::Item as CoreItem;
-use pier_core::transfer::{CancelToken as CoreCancelToken, ProgressSink, TransferOptions};
+use pier_core::transfer::{
+    CancelToken as CoreCancelToken, FolderUpload as CoreFolderUpload, ProgressSink,
+    TransferOptions, UploadMode as CoreUploadMode,
+};
 use pier_core::Error as CoreError;
 
 uniffi::setup_scaffolding!();
@@ -54,11 +57,42 @@ pub struct PierFolderDownload {
     pub total_bytes: u64,
 }
 
+/// test_connection 결과. can_write는 임시 객체 쓰기·삭제가 성공했는지다.
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct PierTestResult {
+    pub can_write: bool,
+}
+
+/// 폴더 업로드 결과.
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct PierFolderUpload {
+    /// 업로드한 파일 수(폴더 마커 제외).
+    pub uploaded: u64,
+    /// 제외 규칙·심볼릭 링크로 건너뛴 항목 수.
+    pub ignored: u64,
+    /// 충돌 모드 때문에 건너뛴 파일 수.
+    pub skipped: u64,
+    /// 업로드 대상 파일들의 총 바이트.
+    pub total_bytes: u64,
+}
+
+/// 업로드 충돌 모드 (SPEC 3.4).
+#[derive(Clone, Debug, uniffi::Enum)]
+pub enum PierUploadMode {
+    /// 대상이 이미 있으면 Conflict 오류.
+    Fail,
+    /// 덮어쓴다. if_match가 있으면 그 ETag와 현재 ETag가 같을 때만 쓴다.
+    Replace { if_match: Option<String> },
+    /// 비어 있는 이름(`이름 (2).확장자`…)을 골라 함께 올린다.
+    KeepBoth,
+}
+
 #[derive(Debug, uniffi::Error)]
 pub enum PierError {
     Authentication { message: String },
     Network { message: String },
     NotFound { message: String },
+    Conflict { message: String },
     Cancelled { message: String },
     Other { message: String },
 }
@@ -69,6 +103,7 @@ impl std::fmt::Display for PierError {
             Self::Authentication { message } => write!(f, "authentication failed: {message}"),
             Self::Network { message } => write!(f, "network error: {message}"),
             Self::NotFound { message } => write!(f, "not found: {message}"),
+            Self::Conflict { message } => write!(f, "conflict: {message}"),
             Self::Cancelled { message } => write!(f, "cancelled: {message}"),
             Self::Other { message } => write!(f, "{message}"),
         }
@@ -84,6 +119,7 @@ impl From<CoreError> for PierError {
             CoreError::Authentication(_) => Self::Authentication { message },
             CoreError::Network(_) => Self::Network { message },
             CoreError::NotFound(_) => Self::NotFound { message },
+            CoreError::Conflict(_) => Self::Conflict { message },
             CoreError::Cancelled(_) => Self::Cancelled { message },
             CoreError::Other(_) => Self::Other { message },
         }
@@ -101,6 +137,26 @@ impl From<CoreItem> for PierEntry {
             last_modified_ms: item.last_modified_ms,
             storage_class: item.storage_class,
         }
+    }
+}
+
+impl From<CoreFolderUpload> for PierFolderUpload {
+    fn from(result: CoreFolderUpload) -> Self {
+        Self {
+            uploaded: result.uploaded,
+            ignored: result.ignored,
+            skipped: result.skipped,
+            total_bytes: result.total_bytes,
+        }
+    }
+}
+
+/// PierUploadMode를 코어 UploadMode로 변환한다.
+fn core_upload_mode(mode: PierUploadMode) -> CoreUploadMode {
+    match mode {
+        PierUploadMode::Fail => CoreUploadMode::Fail,
+        PierUploadMode::Replace { if_match } => CoreUploadMode::Replace { if_match },
+        PierUploadMode::KeepBoth => CoreUploadMode::KeepBoth,
     }
 }
 
@@ -177,10 +233,112 @@ impl PierConnection {
         Ok(Arc::new(Self { conn }))
     }
 
-    /// 원격 루트 목록을 한 번 조회해 연결·인증·버킷 접근을 확인한다.
-    pub async fn test_connection(&self) -> Result<(), PierError> {
-        self.conn.test_connection().await?;
+    /// 원격 루트 목록 조회 + 쓰기 권한(임시 객체 쓰기/삭제) 확인.
+    /// 쓰기 권한이 없으면 can_write=false, 그 외 오류는 PierError.
+    pub async fn test_connection(&self) -> Result<PierTestResult, PierError> {
+        let can_write = self.conn.test_connection().await?;
+        Ok(PierTestResult { can_write })
+    }
+
+    /// parent 아래 names 중 이미 존재하는 항목(파일·폴더 모두,
+    /// 이름은 끝 '/' 없이)을 반환한다. 없으면 결과에서 빠진다.
+    pub async fn existing(
+        &self,
+        parent: String,
+        names: Vec<String>,
+    ) -> Result<Vec<PierEntry>, PierError> {
+        let items = self.conn.existing(&parent, &names).await?;
+        Ok(items.into_iter().map(PierEntry::from).collect())
+    }
+
+    /// src_path 파일을 parent 아래 name으로 업로드한다.
+    /// 기본 전송 옵션(8MB 청크·동시성 8)을 쓴다.
+    pub async fn upload(
+        &self,
+        src_path: String,
+        parent: String,
+        name: String,
+        mode: PierUploadMode,
+        progress: Arc<dyn PierProgress>,
+        cancel: Arc<PierCancelToken>,
+    ) -> Result<PierEntry, PierError> {
+        let mode = core_upload_mode(mode);
+        let opts = TransferOptions::default();
+        let sink = ProgressAdapter(progress);
+        let item = self
+            .conn
+            .upload(
+                Path::new(&src_path),
+                &parent,
+                &name,
+                &mode,
+                &opts,
+                &sink,
+                &cancel.inner,
+            )
+            .await?;
+        Ok(PierEntry::from(item))
+    }
+
+    /// src_dir를 parent 아래 폴더로 재귀 업로드한다(3.6 제외 규칙 적용).
+    /// mode는 대상 폴더 생성과 모든 파일에 적용된다.
+    /// 기본 전송 옵션(8MB 청크·동시성 8)을 쓴다.
+    pub async fn upload_folder(
+        &self,
+        src_dir: String,
+        parent: String,
+        mode: PierUploadMode,
+        progress: Arc<dyn PierProgress>,
+        cancel: Arc<PierCancelToken>,
+    ) -> Result<PierFolderUpload, PierError> {
+        let mode = core_upload_mode(mode);
+        let opts = TransferOptions::default();
+        let sink = ProgressAdapter(progress);
+        let result = self
+            .conn
+            .upload_folder(
+                Path::new(&src_dir),
+                &parent,
+                &mode,
+                &opts,
+                &sink,
+                &cancel.inner,
+            )
+            .await?;
+        Ok(PierFolderUpload::from(result))
+    }
+
+    /// parent 아래 name으로 새 폴더를 만든다. 대상이 이미 있으면 Conflict.
+    pub async fn create_folder(
+        &self,
+        parent: String,
+        name: String,
+    ) -> Result<PierEntry, PierError> {
+        let item = self.conn.create_folder(&parent, &name).await?;
+        Ok(PierEntry::from(item))
+    }
+
+    /// 이름 변경·이동 공통. 폴더는 new_name에 '/' 없이 받는다(코어가 붙임).
+    /// 대상이 이미 있으면 Conflict.
+    pub async fn rename(
+        &self,
+        key: String,
+        new_parent: String,
+        new_name: String,
+    ) -> Result<PierEntry, PierError> {
+        let item = self.conn.rename(&key, &new_parent, &new_name).await?;
+        Ok(PierEntry::from(item))
+    }
+
+    /// 삭제. 폴더 키(끝 '/')면 하위 객체 전체가 삭제된다.
+    pub async fn delete(&self, key: String) -> Result<(), PierError> {
+        self.conn.delete(&key).await?;
         Ok(())
+    }
+
+    /// 중단된 폴더 이름 변경을 이어서 완료하고 처리 건수를 반환한다.
+    pub async fn resume_pending_ops(&self) -> Result<u32, PierError> {
+        Ok(self.conn.resume_pending_ops().await?)
     }
 
     /// 폴더 목록 한 페이지. complete 캐시면 캐시에서 즉시 응답한다.

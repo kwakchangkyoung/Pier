@@ -173,15 +173,18 @@ pub struct ConnectionConfig {
 | API | 설명 |
 |---|---|
 | `Connection.open(config, secret, cacheDir)` | 연결 생성, 캐시 SQLite 열기 |
-| `testConnection()` | 버킷 접근, 목록 1건, 쓰기 권한 여부 확인 결과 반환 |
+| `testConnection()` | 목록 + 쓰기 권한(임시 객체 쓰기/삭제) |
 | `item(key)` | 단일 아이템 메타데이터 (stat) |
 | `listPage(folder, cursor?)` | 폴더 목록 한 페이지 + 다음 커서 (캐시 여부 표시 포함) |
 | `refresh(folder)` | 백그라운드 재조회 결과로 추가·변경·삭제 목록 반환 |
 | `download(key, destPath, progress, cancel)` | 내려받기 |
 | `upload(srcPath, parent, name, ifMatch?, progress, cancel)` | 생성/수정 업로드 (ifMatch는 조건부 쓰기용 기준 ETag) |
+| `existing(parent, names)` | parent 아래 이미 존재하는 항목(파일·폴더) 조회 |
+| `uploadFolder(srcDir, parent, mode, progress, cancel)` | 폴더 재귀 업로드 (3.6 제외 규칙 적용) |
 | `createFolder(parent, name)` | 폴더 생성 |
 | `rename(key, newParent, newName)` | 이동·이름 변경 |
 | `delete(key)` | 삭제 |
+| `resumePendingOps()` | 중단된 폴더 이름 변경 이어서 완료, 처리 건수 반환 |
 | `presign(key, expiresSecs)` | presigned GET URL |
 
 - Rust 타입은 UniFFI Record/Enum으로 노출하고, Swift 쪽 뷰 모델로 감싸는 변환은 `PierApp`에서 한다.

@@ -20,7 +20,9 @@ use crate::item::Item;
 use crate::key;
 pub use crate::metadata::Changes;
 use crate::metadata::MetadataStore;
-use crate::transfer::{CancelToken, FolderDownload, ProgressSink, TransferOptions};
+use crate::transfer::{
+    CancelToken, FolderDownload, FolderUpload, ProgressSink, TransferOptions, UploadMode,
+};
 
 /// 캐시에서 한 페이지에 담는 최대 항목 수(SPEC 4.3).
 pub const PAGE_SIZE: usize = 1000;
@@ -130,10 +132,13 @@ impl<B: Backend> Connection<B> {
         store.replace_folder(&prefix, &items, now_ms())
     }
 
-    /// 원격 루트 목록을 한 번 조회해 연결·인증·버킷 접근 가능 여부만
-    /// 확인한다. 캐시에는 아무것도 쓰지 않고, 에러는 그대로 전파한다.
-    pub async fn test_connection(&self) -> Result<(), Error> {
-        self.backend.list_folder("").await.map(|_| ())
+    /// 원격 루트 목록을 한 번 조회해 연결·인증·버킷 접근을 확인하고,
+    /// 이어서 임시 객체 쓰기·삭제로 쓰기 권한을 판정한다(SPEC 3.1).
+    /// 쓰기 권한이 없으면 Ok(false)이고, 그 외 오류는 Err로 전파한다.
+    /// 캐시에는 아무것도 쓰지 않는다.
+    pub async fn test_connection(&self) -> Result<bool, Error> {
+        self.backend.list_folder("").await?;
+        crate::ops::test_write(&self.backend).await
     }
 
     /// 단일 아이템 메타데이터. 캐시에 있으면 캐시, 없으면 원격.
@@ -145,6 +150,37 @@ impl<B: Backend> Connection<B> {
             }
         }
         self.backend.stat(key).await
+    }
+
+    /// parent 아래 names 중 원격에 이미 있는 항목(파일·폴더 모두,
+    /// 이름은 끝 '/' 없이)을 반환한다. 없는 이름은 결과에서 빠진다.
+    pub async fn existing(&self, parent: &str, names: &[String]) -> Result<Vec<Item>, Error>
+    where
+        B: Send + Sync,
+    {
+        crate::transfer::existing(&self.backend, parent, names).await
+    }
+
+    /// parent 아래 name으로 새 폴더를 만들고 캐시에 반영한다.
+    /// 대상 이름이 이미 있으면 Error::Conflict.
+    pub async fn create_folder(&self, parent: &str, name: &str) -> Result<Item, Error> {
+        crate::ops::create_folder(&self.backend, &self.store, parent, name).await
+    }
+
+    /// 이름 변경·이동 공통. 대상이 이미 있으면 Error::Conflict.
+    /// 폴더 키는 new_name에 '/' 없이 받아 코어가 붙인다.
+    pub async fn rename(&self, key: &str, new_parent: &str, new_name: &str) -> Result<Item, Error> {
+        crate::ops::rename(&self.backend, &self.store, key, new_parent, new_name).await
+    }
+
+    /// 삭제. 폴더 키(끝 '/')면 하위 객체 전체를 배치 삭제한다.
+    pub async fn delete(&self, key: &str) -> Result<(), Error> {
+        crate::ops::delete(&self.backend, &self.store, key).await
+    }
+
+    /// 중단된 폴더 이름 변경을 이어서 완료하고 처리 건수를 반환한다.
+    pub async fn resume_pending_ops(&self) -> Result<u32, Error> {
+        crate::ops::resume_pending_ops(&self.backend, &self.store).await
     }
 
     /// 뮤텍스 잠금. 포이즌(잠금 보유 중 패닉)이면 다른 오류로 변환한다.
@@ -185,6 +221,71 @@ where
         crate::transfer::download_folder(&self.backend, prefix, dest_dir, opts, progress, cancel)
             .await
     }
+
+    /// src 파일을 parent 아래 name으로 업로드하고 캐시에 반영한다.
+    /// mode·충돌 처리는 transfer::upload와 같다.
+    #[allow(clippy::too_many_arguments)] // FFI 계약상 시그니처가 고정돼 있다.
+    pub async fn upload(
+        &self,
+        src: &Path,
+        parent: &str,
+        name: &str,
+        mode: &UploadMode,
+        opts: &TransferOptions,
+        progress: &dyn ProgressSink,
+        cancel: &CancelToken,
+    ) -> Result<Item, Error> {
+        let item = crate::transfer::upload(
+            &self.backend,
+            src,
+            parent,
+            name,
+            mode,
+            opts,
+            progress,
+            cancel,
+        )
+        .await?;
+        self.lock()?.upsert_item(&item, now_ms())?;
+        Ok(item)
+    }
+
+    /// src_dir를 parent 아래 폴더로 재귀 업로드한다(3.6 제외 규칙 적용).
+    /// mode는 대상 폴더 생성과 모든 파일에 적용된다.
+    /// 성공 후 대상 폴더의 하위 캐시를 지우고 폴더 항목만 넣는다 —
+    /// KeepBoth로 실제 키를 알 수 없어 하위는 다음 열람 때 원격에서
+    /// 새로 받는다.
+    pub async fn upload_folder(
+        &self,
+        src_dir: &Path,
+        parent: &str,
+        mode: &UploadMode,
+        opts: &TransferOptions,
+        progress: &dyn ProgressSink,
+        cancel: &CancelToken,
+    ) -> Result<FolderUpload, Error> {
+        let result = crate::transfer::upload_folder(
+            &self.backend,
+            src_dir,
+            parent,
+            mode,
+            opts,
+            progress,
+            cancel,
+        )
+        .await?;
+        if let Some(name) = src_dir
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .filter(|n| !n.is_empty())
+        {
+            let prefix = key::child_key(&key::normalize_prefix(parent), &name, true);
+            let mut store = self.lock()?;
+            store.remove_item(&prefix)?;
+            store.upsert_item(&Item::folder(prefix), now_ms())?;
+        }
+        Ok(result)
+    }
 }
 
 /// 현재 시각의 Unix epoch 밀리초.
@@ -210,6 +311,8 @@ mod tests {
         folders: Arc<Mutex<HashMap<String, Vec<Item>>>>,
         list_calls: Arc<AtomicUsize>,
         auth_fail: Arc<AtomicBool>,
+        write_deny: Arc<AtomicBool>,
+        writes: Arc<Mutex<Vec<String>>>,
         hold: Arc<tokio::sync::Mutex<()>>,
     }
 
@@ -232,6 +335,15 @@ mod tests {
 
         fn fail_auth(&self) {
             self.auth_fail.store(true, Ordering::SeqCst);
+        }
+
+        fn deny_write(&self) {
+            self.write_deny.store(true, Ordering::SeqCst);
+        }
+
+        /// write_bytes로 쓰인 키 목록(삭제된 것은 빠진다).
+        fn written(&self) -> Vec<String> {
+            self.writes.lock().unwrap().clone()
         }
     }
 
@@ -257,6 +369,22 @@ mod tests {
 
         async fn stat(&self, key: &str) -> Result<Item, Error> {
             Err(Error::NotFound(key.to_string()))
+        }
+
+        async fn write_bytes(&self, key: &str, _data: Vec<u8>) -> Result<(), Error> {
+            if self.write_deny.load(Ordering::SeqCst) {
+                return Err(Error::Authentication("fake: 쓰기 권한 없음".to_string()));
+            }
+            self.writes.lock().unwrap().push(key.to_string());
+            Ok(())
+        }
+
+        async fn delete_keys(&self, keys: &[String]) -> Result<(), Error> {
+            let mut writes = self.writes.lock().unwrap();
+            for key in keys {
+                writes.retain(|w| w != key);
+            }
+            Ok(())
         }
     }
 
@@ -520,9 +648,17 @@ mod tests {
         let backend = FakeBackend::default();
         let conn =
             Connection::with_backend(backend.clone(), MetadataStore::open_in_memory().unwrap());
-        conn.test_connection().await.expect("연결 성공이어야 한다");
+        let can_write = conn.test_connection().await.expect("연결 성공이어야 한다");
+        assert!(can_write, "쓰기 가능해야 한다");
+        // 쓰기 테스트 객체는 쓰고 지워져 남지 않는다.
+        assert!(backend.written().is_empty());
         // 캐시에 아무것도 쓰지 않는다.
         assert!(conn.lock().unwrap().folder_state("").unwrap().is_none());
+
+        // 쓰기 권한이 없으면 can_write=false (오류가 아니다).
+        backend.deny_write();
+        let can_write = conn.test_connection().await.expect("읽기는 성공해야 한다");
+        assert!(!can_write);
 
         backend.fail_auth();
         let err = conn.test_connection().await.expect_err("실패해야 한다");

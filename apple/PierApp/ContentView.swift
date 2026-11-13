@@ -4,7 +4,8 @@ import SwiftUI
 struct ContentView: View {
     let store: ConnectionStore
     @Bindable var sessions: PierSessions
-    let downloads: DownloadManager
+    let transfers: TransferManager
+    let uploads: UploadController
     @Environment(\.openSettings) private var openSettings
 
     var body: some View {
@@ -53,7 +54,7 @@ struct ContentView: View {
     @ViewBuilder
     private var detailContent: some View {
         if let browser = sessions.activeBrowser {
-            BrowserView(model: browser, downloads: downloads)
+            BrowserView(model: browser, transfers: transfers, uploads: uploads)
                 // 연결 재생성(설정 변경) 시 뷰 상태를 초기화하기 위해 인스턴스 기준 id를 쓴다.
                 .id(ObjectIdentifier(browser))
         } else {

@@ -10,6 +10,10 @@ pub enum Error {
     Network(String),
     #[error("not found: {0}")]
     NotFound(String),
+    /// 조건부 쓰기 실패(If-Match 불일치, If-None-Match 충돌, HEAD 비교 불일치).
+    /// 앱은 덮어쓰기 확인 대화상자를 띄운다(SPEC 3.4, 4.5).
+    #[error("conflict: {0}")]
+    Conflict(String),
     #[error("cancelled: {0}")]
     Cancelled(String),
     #[error("{0}")]
@@ -46,6 +50,11 @@ impl Error {
         match kind {
             opendal::ErrorKind::PermissionDenied => Error::Authentication(message),
             opendal::ErrorKind::NotFound => Error::NotFound(message),
+            // 조건부 쓰기(If-Match/If-None-Match) 실패와 서비스 측 충돌은
+            // 모두 덮어쓰기 확인이 필요한 Conflict로 분류한다(SPEC 3.4).
+            opendal::ErrorKind::ConditionNotMatch | opendal::ErrorKind::Conflict => {
+                Error::Conflict(message)
+            }
             _ if is_network_error(&err) => Error::Network(message),
             _ => Error::Other(message),
         }

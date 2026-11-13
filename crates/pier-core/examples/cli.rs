@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use pier_core::config::{ConnectionConfig, Provider};
 use pier_core::enumerate::Connection;
-use pier_core::transfer::{self, CancelToken, ProgressSink, TransferOptions};
+use pier_core::transfer::{self, CancelToken, ProgressSink, TransferOptions, UploadMode};
 use pier_core::{Item, OpendalS3};
 
 fn env_or(key: &str, default: &str) -> String {
@@ -52,6 +52,24 @@ impl ProgressSink for CliProgress {
             self.0.store(pct, Ordering::Relaxed);
             eprintln!("진행률 {pct}% ({transferred}/{total} bytes)");
         }
+    }
+}
+
+fn transfer_opts() -> TransferOptions {
+    TransferOptions {
+        chunk_size: env_u64("PIER_CHUNK_MB", 8).saturating_mul(1024 * 1024),
+        concurrency: env_u64("PIER_CONCURRENCY", 8) as usize,
+    }
+}
+
+/// `--keep-both`/`--replace` 플래그를 UploadMode로 변환한다.
+fn upload_mode(args: &[String]) -> UploadMode {
+    if args.iter().any(|a| a == "--keep-both") {
+        UploadMode::KeepBoth
+    } else if args.iter().any(|a| a == "--replace") {
+        UploadMode::Replace { if_match: None }
+    } else {
+        UploadMode::Fail
     }
 }
 
@@ -123,10 +141,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let dest = args.get(3).ok_or("사용법: cli get <key> <dest>")?;
             // 다운로드는 캐시를 쓰지 않으므로 백엔드를 직접 연다.
             let backend = OpendalS3::new(&minio_config(), &secret)?;
-            let opts = TransferOptions {
-                chunk_size: env_u64("PIER_CHUNK_MB", 8).saturating_mul(1024 * 1024),
-                concurrency: env_u64("PIER_CONCURRENCY", 8) as usize,
-            };
+            let opts = transfer_opts();
             let progress = CliProgress::default();
             let start = std::time::Instant::now();
             let written = transfer::download(
@@ -155,10 +170,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .ok_or("사용법: cli get-dir <prefix> <dest_dir>")?;
             // 폴더 다운로드도 캐시를 쓰지 않으므로 백엔드를 직접 연다.
             let backend = OpendalS3::new(&minio_config(), &secret)?;
-            let opts = TransferOptions {
-                chunk_size: env_u64("PIER_CHUNK_MB", 8).saturating_mul(1024 * 1024),
-                concurrency: env_u64("PIER_CONCURRENCY", 8) as usize,
-            };
+            let opts = transfer_opts();
             let progress = CliProgress::default();
             let start = std::time::Instant::now();
             let result = transfer::download_folder(
@@ -181,8 +193,116 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
             Ok(())
         }
+        Some("put") => {
+            let src = args
+                .get(2)
+                .ok_or("사용법: cli put <src> <parent> [--keep-both|--replace]")?;
+            let parent = args
+                .get(3)
+                .ok_or("사용법: cli put <src> <parent> [--keep-both|--replace]")?;
+            let src_path = PathBuf::from(src);
+            let name = src_path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .filter(|n| !n.is_empty())
+                .ok_or("파일 이름을 알 수 없다")?;
+            if src_path.is_dir() {
+                return Err("put은 파일만 받는다. 폴더는 put-dir를 쓴다".into());
+            }
+            // 업로드도 캐시를 쓰지 않으므로 백엔드를 직접 연다.
+            let backend = OpendalS3::new(&minio_config(), &secret)?;
+            let opts = transfer_opts();
+            let mode = upload_mode(&args);
+            let progress = CliProgress::default();
+            let start = std::time::Instant::now();
+            let item = transfer::upload(
+                &backend,
+                &src_path,
+                parent,
+                &name,
+                &mode,
+                &opts,
+                &progress,
+                &CancelToken::new(),
+            )
+            .await?;
+            let secs = start.elapsed().as_secs_f64();
+            let mb = item.size as f64 / (1024.0 * 1024.0);
+            eprintln!(
+                "{} bytes -> {} ({secs:.2}s, {:.1} MB/s)",
+                item.size,
+                item.key,
+                mb / secs
+            );
+            Ok(())
+        }
+        Some("put-dir") => {
+            let src = args
+                .get(2)
+                .ok_or("사용법: cli put-dir <src_dir> <parent> [--keep-both|--replace]")?;
+            let parent = args
+                .get(3)
+                .ok_or("사용법: cli put-dir <src_dir> <parent> [--keep-both|--replace]")?;
+            let src_path = PathBuf::from(src);
+            if !src_path.is_dir() {
+                return Err("put-dir은 디렉터리만 받는다".into());
+            }
+            let backend = OpendalS3::new(&minio_config(), &secret)?;
+            let opts = transfer_opts();
+            let mode = upload_mode(&args);
+            let progress = CliProgress::default();
+            let start = std::time::Instant::now();
+            let result = transfer::upload_folder(
+                &backend,
+                &src_path,
+                parent,
+                &mode,
+                &opts,
+                &progress,
+                &CancelToken::new(),
+            )
+            .await?;
+            let secs = start.elapsed().as_secs_f64();
+            let mb = result.total_bytes as f64 / (1024.0 * 1024.0);
+            eprintln!(
+                "{}개 업로드, {}개 제외, {}개 건너뜀, {} bytes ({secs:.2}s, {:.1} MB/s)",
+                result.uploaded,
+                result.ignored,
+                result.skipped,
+                result.total_bytes,
+                mb / secs
+            );
+            Ok(())
+        }
+        Some("mkdir") => {
+            let parent = args.get(2).ok_or("사용법: cli mkdir <parent> <name>")?;
+            let name = args.get(3).ok_or("사용법: cli mkdir <parent> <name>")?;
+            let item = conn.create_folder(parent, name).await?;
+            print_item(&item);
+            Ok(())
+        }
+        Some("mv") => {
+            let key = args
+                .get(2)
+                .ok_or("사용법: cli mv <key> <new_parent> <new_name>")?;
+            let new_parent = args
+                .get(3)
+                .ok_or("사용법: cli mv <key> <new_parent> <new_name>")?;
+            let new_name = args
+                .get(4)
+                .ok_or("사용법: cli mv <key> <new_parent> <new_name>")?;
+            let item = conn.rename(key, new_parent, new_name).await?;
+            print_item(&item);
+            Ok(())
+        }
+        Some("rm") => {
+            let key = args.get(2).ok_or("사용법: cli rm <key>")?;
+            conn.delete(key).await?;
+            println!("deleted {key}");
+            Ok(())
+        }
         _ => {
-            eprintln!("사용법: cli ls [폴더] | cli refresh [폴더] | cli stat <key> | cli get <key> <dest> | cli get-dir <prefix> <dest_dir>");
+            eprintln!("사용법: cli ls [폴더] | cli refresh [폴더] | cli stat <key> | cli get <key> <dest> | cli get-dir <prefix> <dest_dir> | cli put <src> <parent> [--keep-both|--replace] | cli put-dir <src_dir> <parent> [--keep-both|--replace] | cli mkdir <parent> <name> | cli mv <key> <new_parent> <new_name> | cli rm <key>");
             std::process::exit(2);
         }
     }

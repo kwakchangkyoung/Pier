@@ -1,11 +1,32 @@
 import AppKit
 import SwiftUI
 
+/// 이름 입력 시트의 대상. 새 폴더 만들기와 이름 변경을 구분한다.
+enum NameAction: Identifiable {
+    case createFolder
+    case rename(PierEntry)
+
+    var id: String {
+        switch self {
+        case .createFolder: return "create-folder"
+        case .rename(let entry): return "rename-\(entry.identifier)"
+        }
+    }
+}
+
 /// 선택한 연결의 파일 브라우저 본문.
+/// 쓰기 동작(업로드/이름/삭제)은 BrowserView+Write.swift의 extension이 담당한다.
 struct BrowserView: View {
     let model: BrowserModel
-    let downloads: DownloadManager
-    @State private var selection = Set<String>()
+    let transfers: TransferManager
+    let uploads: UploadController
+    /// extension 파일에서도 접근하므로 internal이다.
+    @State var selection = Set<String>()
+    @State var nameAction: NameAction?
+    @State var nameDraft = ""
+    @State var nameError: String?
+    @State var pendingDelete: [PierEntry]?
+    @State var actionError: String?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -16,17 +37,66 @@ struct BrowserView: View {
                 Divider()
             }
             content
-            if !downloads.items.isEmpty {
-                DownloadBar(manager: downloads)
+            if !transfers.items.isEmpty {
+                TransferBar(manager: transfers)
             }
         }
         .navigationTitle(model.title)
         .toolbar { toolbarItems }
+        .sheet(isPresented: conflictSheetPresented) {
+            if let conflict = uploads.activeConflict {
+                UploadConflictSheet(conflict: conflict) { choice, applyToAll in
+                    uploads.resolveActiveConflict(choice: choice, applyToAll: applyToAll)
+                }
+            }
+        }
+        .sheet(item: $nameAction) { action in
+            NamePromptSheet(
+                title: nameSheetTitle(for: action),
+                name: $nameDraft,
+                error: nameError,
+                onSubmit: { submitName(action) },
+                onCancel: { nameAction = nil }
+            )
+        }
+        .confirmationDialog(
+            "삭제",
+            isPresented: Binding(
+                get: { pendingDelete != nil },
+                set: { if !$0 { pendingDelete = nil } }
+            ),
+            titleVisibility: .visible,
+            presenting: pendingDelete
+        ) { entries in
+            Button("삭제", role: .destructive) { confirmDelete(entries) }
+            Button("취소", role: .cancel) { pendingDelete = nil }
+        } message: { entries in
+            Text(deleteMessage(for: entries))
+        }
+        .alert(
+            "작업을 완료하지 못했습니다",
+            isPresented: Binding(
+                get: { actionError != nil },
+                set: { if !$0 { actionError = nil } }
+            )
+        ) {
+            Button("확인") { actionError = nil }
+        } message: {
+            Text(actionError ?? "")
+        }
+    }
+
+    /// 충돌 시트 표시 여부. 닫힐 때 선택 없이(nil) resolves해 건너뛰기로 처리한다.
+    private var conflictSheetPresented: Binding<Bool> {
+        Binding(
+            get: { uploads.activeConflict != nil },
+            set: { if !$0 { uploads.resolveActiveConflict(choice: nil, applyToAll: false) } }
+        )
     }
 
     // MARK: - breadcrumb
 
-    private var breadcrumbBar: some View {
+    var breadcrumbBar: some View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 2) {
                 ForEach(model.path.indices, id: \.self) { index in
@@ -44,6 +114,8 @@ struct BrowserView: View {
                     .buttonStyle(.plain)
                     .font(index == model.path.count - 1 ? .body.weight(.medium) : .body)
                     .foregroundStyle(index == model.path.count - 1 ? .primary : .secondary)
+                    // 경로 구간에 놓으면 그 폴더로 이동/업로드한다.
+                    .onDrop(of: RemoteDropDelegate.types, delegate: dropDelegate(for: model.path[index]))
                 }
             }
             .padding(.horizontal, 12)
@@ -51,22 +123,46 @@ struct BrowserView: View {
         }
     }
 
-    private func segmentTitle(at index: Int) -> String {
+    func segmentTitle(at index: Int) -> String {
         let folder = model.path[index]
         guard !folder.isEmpty else { return model.title }
         let trimmed = folder.hasSuffix("/") ? String(folder.dropLast()) : folder
         return trimmed.split(separator: "/").last.map(String.init) ?? folder
     }
 
+    /// breadcrumb 구간/빈 영역용 SwiftUI 드롭 델리게이트.
+    func dropDelegate(for parent: String) -> RemoteDropDelegate {
+        RemoteDropDelegate(parentKey: parent) { payload, target in
+            handleDrop(payload: payload, parent: target)
+        }
+    }
+
+    /// 외부 파일은 업로드, 내부 항목 키는 이동으로 처리한다.
+    func handleDrop(payload: DropPayload, parent: String) {
+        guard model.canWrite, model.connection != nil else { return }
+        if !payload.keys.isEmpty {
+            Task {
+                do {
+                    try await model.moveEntries(keys: payload.keys, toParent: parent)
+                } catch {
+                    actionError = PierErrorPresenter.message(for: error) ?? "이동에 실패했습니다."
+                }
+            }
+        }
+        if !payload.urls.isEmpty {
+            startUploads(payload.urls, parent: parent)
+        }
+    }
+
     // MARK: - 내용
 
     /// 목록이 있는데 phase가 failed면 상단에 오류 배너를 띄운다(갱신 실패 등).
-    private var errorBannerMessage: String? {
+    var errorBannerMessage: String? {
         guard case .failed(let message) = model.phase, !model.entries.isEmpty else { return nil }
         return message
     }
 
-    private func bannerView(_ message: String) -> some View {
+    func bannerView(_ message: String) -> some View {
         HStack(spacing: 8) {
             Image(systemName: "exclamationmark.triangle.fill")
                 .foregroundStyle(.yellow)
@@ -83,18 +179,37 @@ struct BrowserView: View {
     }
 
     @ViewBuilder
-    private var content: some View {
+    var content: some View {
         if model.entries.isEmpty {
             emptyState
+                // 빈 폴더/로딩 영역에 놓인 드롭도 현재 폴더 대상으로 처리한다.
+                .onDrop(of: RemoteDropDelegate.types, delegate: dropDelegate(for: model.currentFolder))
         } else {
             FileTableView(
                 entries: model.entries,
                 selection: $selection,
+                currentParent: model.currentFolder,
+                canWrite: model.canWrite,
                 onOpenFolder: { entry in
                     model.navigate(toFolder: entry.identifier)
                 },
                 onDownload: { entries in
                     downloadEntries(entries)
+                },
+                onRename: { entry in
+                    beginRename(entry)
+                },
+                onDelete: { entries in
+                    pendingDelete = entries
+                },
+                onMoveKeys: { keys, parent in
+                    handleDrop(payload: DropPayload(keys: keys), parent: parent)
+                },
+                onUploadURLs: { urls, parent in
+                    startUploads(urls, parent: parent)
+                },
+                makePromiseHandler: { entry in
+                    makePromiseHandler(for: entry)
                 }
             )
             .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -102,7 +217,7 @@ struct BrowserView: View {
     }
 
     @ViewBuilder
-    private var emptyState: some View {
+    var emptyState: some View {
         switch model.phase {
         case .idle, .loading:
             ProgressView("목록을 불러오는 중…")
@@ -120,69 +235,5 @@ struct BrowserView: View {
             ContentUnavailableView("빈 폴더", systemImage: "folder")
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
-    }
-
-    // MARK: - 툴바/다운로드
-
-    @ToolbarContentBuilder
-    private var toolbarItems: some ToolbarContent {
-        ToolbarItemGroup(placement: .navigation) {
-            Button {
-                model.goBack()
-            } label: {
-                Label("뒤로", systemImage: "chevron.left")
-            }
-            .disabled(!model.canGoBack)
-            Button {
-                model.goForward()
-            } label: {
-                Label("앞으로", systemImage: "chevron.right")
-            }
-            .disabled(!model.canGoForward)
-        }
-        ToolbarItemGroup(placement: .primaryAction) {
-            if model.phase == .loading || model.isRefreshing {
-                ProgressView()
-                    .controlSize(.small)
-            }
-            Button {
-                model.reload()
-            } label: {
-                Label("새로고침", systemImage: "arrow.clockwise")
-            }
-            .keyboardShortcut("r")
-            Button {
-                downloadSelection()
-            } label: {
-                Label("다운로드", systemImage: "arrow.down.to.line")
-            }
-            .disabled(!canDownload)
-        }
-    }
-
-    private var selectedEntries: [PierEntry] {
-        model.entries.filter { selection.contains($0.identifier) }
-    }
-
-    /// 선택 항목이 하나라도 있으면 다운로드할 수 있다(파일·폴더 모두 지원).
-    private var canDownload: Bool {
-        !selectedEntries.isEmpty
-    }
-
-    private func downloadSelection() {
-        downloadEntries(selectedEntries)
-    }
-
-    /// 선택한 파일·폴더를 한 번의 패널로 저장 위치를 고른 뒤 DownloadManager에 넘긴다.
-    private func downloadEntries(_ entries: [PierEntry]) {
-        guard !entries.isEmpty, let connection = model.connection else { return }
-        let panel = NSOpenPanel()
-        panel.canChooseDirectories = true
-        panel.canChooseFiles = false
-        panel.allowsMultipleSelection = false
-        panel.prompt = "다운로드"
-        panel.message = "항목을 저장할 폴더를 선택하세요."
-        guard panel.runModal() == .OK, let directory = panel.url else { return }
-        downloads.start(connection: connection, entries: entries, into: directory)
     }
 }

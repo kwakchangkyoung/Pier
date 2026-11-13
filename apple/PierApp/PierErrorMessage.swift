@@ -26,6 +26,7 @@ enum PierErrorPresenter {
         case .Authentication: return "authentication"
         case .Network: return "network"
         case .NotFound: return "notFound"
+        case .Conflict: return "conflict"
         case .Cancelled: return "cancelled"
         case .Other: return "other"
         }
@@ -39,6 +40,12 @@ enum PierErrorPresenter {
             return "네트워크에 연결할 수 없습니다. 네트워크 연결을 확인하고 다시 시도하세요."
         case .NotFound:
             return "항목을 찾을 수 없습니다. 이미 삭제되었을 수 있으니 목록을 새로고침하세요."
+        case .Conflict(let message):
+            // 업로드 중 Conflict는 TransferManager가 재질문하므로 여기 오면
+            // 이름 변경 등 다른 쓰기 경로다. 상세는 코어 메시지를 그대로 보인다.
+            return message.isEmpty
+                ? "다른 곳에서 변경되었습니다."
+                : "다른 곳에서 변경되었습니다. \(message)"
         case .Cancelled:
             return nil
         case .Other(let message):
@@ -61,6 +68,8 @@ enum PierErrorPresenter {
             return "세션을 사용할 수 없습니다."
         case .invalidConfiguration:
             return "연결 설정이 올바르지 않습니다. 설정을 확인하세요."
+        case .invalidName:
+            return "이름은 비워 둘 수 없고 '/'를 포함할 수 없습니다."
         }
     }
 }

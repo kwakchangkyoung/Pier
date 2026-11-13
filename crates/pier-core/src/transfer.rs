@@ -1,22 +1,27 @@
-//! SPEC 4.4 다운로드: 범위 읽기 병렬 전송, 취소, 진행률.
+//! SPEC 4.4 전송: 범위 읽기 병렬 다운로드, 업로드, 취소, 진행률.
 //!
-//! 객체 크기가 chunk_size 이하면 범위 요청 1개, 초과하면 chunk_size 범위를
-//! 최대 concurrency개 동시에 요청해 임시 파일의 정해진 오프셋에 직접 쓴다.
-//! 모든 작업은 dest와 같은 디렉터리의 임시 파일(`.<이름>.pierdownload`)에
-//! 쓰고, 크기 검증 후 rename한다. 실패·취소 시 임시 파일을 지우고 dest는
-//! 건드리지 않는다.
+//! 다운로드는 객체 크기가 chunk_size 이하면 범위 요청 1개, 초과하면
+//! chunk_size 범위를 최대 concurrency개 동시에 요청해 임시 파일의 정해진
+//! 오프셋에 직접 쓴다. 모든 작업은 dest와 같은 디렉터리의 임시 파일
+//! (`.<이름>.pierdownload`)에 쓰고, 크기 검증 후 rename한다.
+//! 실패·취소 시 임시 파일을 지우고 dest는 건드리지 않는다.
+//!
+//! 업로드는 크기가 part_size 이하면 단일 PUT, 초과하면 part_size 파트의
+//! 멀티파트 업로드를 backend.put_file에 위임한다. 취소·실패 시 미완료
+//! 멀티파트는 백엔드가 abort해 원격에 객체를 남기지 않는다(SPEC 3.4).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::{Notify, Semaphore};
 use tokio::task::JoinSet;
 
-use crate::backend::Backend;
+use crate::backend::{Backend, PutOptions, WriteCondition};
 use crate::error::Error;
+use crate::ignore;
 use crate::item::Item;
 use crate::key;
 
@@ -609,6 +614,529 @@ fn temp_path(dest: &Path) -> PathBuf {
 
 fn cancelled_error() -> Error {
     Error::Cancelled("다운로드가 취소됐다".to_string())
+}
+
+// ===== 업로드 (SPEC 3.4, 4.4) =====
+
+/// 업로드 충돌 모드 (SPEC 3.4).
+#[derive(Debug, Clone)]
+pub enum UploadMode {
+    /// 대상이 이미 있으면 Error::Conflict.
+    Fail,
+    /// 덮어쓴다. `if_match`가 Some이면 그 ETag와 현재 ETag가 같을 때만
+    /// 쓰고, 다르거나 없으면 Error::Conflict. None이면 무조건 덮어쓴다.
+    Replace { if_match: Option<String> },
+    /// 비어 있는 이름(`이름 (2).확장자`…)을 골라 함께 올린다.
+    KeepBoth,
+}
+
+/// 폴더 업로드 결과.
+#[derive(Debug)]
+pub struct FolderUpload {
+    /// 업로드한 파일 수(폴더 마커 제외).
+    pub uploaded: u64,
+    /// 제외 규칙·심볼릭 링크로 건너뛴 항목 수.
+    pub ignored: u64,
+    /// 충돌 모드 때문에 건너뛴 파일 수(Fail·KeepBoth의 Conflict).
+    pub skipped: u64,
+    /// 업로드 대상 파일들의 총 바이트.
+    pub total_bytes: u64,
+}
+
+/// src 파일 하나를 parent 아래 name으로 업로드하고 원격 stat 결과를 반환한다.
+///
+/// - `mode`가 KeepBoth면 parent 목록에서 비어 있는 이름을 먼저 고른다.
+/// - 성공 후 stat 결과를 Item으로 반환한다(stat 실패 시 에러 전파).
+#[allow(clippy::too_many_arguments)] // FFI 계약상 시그니처가 고정돼 있다.
+pub async fn upload<B>(
+    backend: &B,
+    src: &Path,
+    parent: &str,
+    name: &str,
+    mode: &UploadMode,
+    opts: &TransferOptions,
+    progress: &dyn ProgressSink,
+    cancel: &CancelToken,
+) -> Result<Item, Error>
+where
+    B: Backend + Send + Sync,
+{
+    if cancel.is_cancelled() {
+        return Err(cancelled_error());
+    }
+    if name.is_empty() || name.contains('/') {
+        return Err(Error::Other(format!("업로드할 수 없는 이름이다: {name}")));
+    }
+    let meta = tokio::fs::metadata(src).await?;
+    if !meta.is_file() {
+        return Err(Error::Other(format!("{}는 파일이 아니다", src.display())));
+    }
+    let size = meta.len();
+
+    let parent = key::normalize_prefix(parent);
+    let resolved = resolve_name(backend, &parent, name, mode).await?;
+    let remote_key = key::child_key(&parent, &resolved, false);
+
+    let condition = mode_condition(mode);
+    let popts = PutOptions {
+        condition,
+        part_size: part_size_for(size),
+        concurrency: opts.concurrency,
+    };
+    backend
+        .put_file(&remote_key, src, popts, progress, cancel)
+        .await?;
+    backend.stat(&remote_key).await
+}
+
+/// src_dir의 이름으로 parent 아래 폴더를 만들고 내용을 재귀 업로드한다.
+/// 대상 폴더가 이미 있으면 그 안에 병합한다(파일 단위 충돌은 mode 적용).
+///
+/// - `ignore::is_ignored`에 걸리는 항목과 심볼릭 링크는 건너뛰고
+///   ignored로 센다(링크는 따라가지 않는다).
+/// - 내용이 전혀 없는 디렉터리는 폴더 마커 객체로 만든다.
+/// - 총 동시 요청 수는 opts.concurrency를 넘지 않는다(파일별 파트 수만큼
+///   세마포어를 잡는 가중 세마포어).
+pub async fn upload_folder<B>(
+    backend: &B,
+    src_dir: &Path,
+    parent: &str,
+    mode: &UploadMode,
+    opts: &TransferOptions,
+    progress: &dyn ProgressSink,
+    cancel: &CancelToken,
+) -> Result<FolderUpload, Error>
+where
+    B: Backend + Clone + Send + Sync + 'static,
+{
+    if cancel.is_cancelled() {
+        return Err(cancelled_error());
+    }
+    let meta = tokio::fs::metadata(src_dir).await?;
+    if !meta.is_dir() {
+        return Err(Error::Other(format!(
+            "{}는 디렉터리가 아니다",
+            src_dir.display()
+        )));
+    }
+    let folder_name = src_dir
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .filter(|n| !n.is_empty())
+        .ok_or_else(|| Error::Other(format!("폴더 이름을 알 수 없다: {}", src_dir.display())))?;
+
+    let parent = key::normalize_prefix(parent);
+    let target_prefix = key::child_key(&parent, &folder_name, true);
+
+    // 로컬 트리 스캔: 파일 목록, 빈 디렉터리 마커 목록, 무시 수.
+    let mut tree = LocalTree::default();
+    let has_content = scan_dir(src_dir, "", &mut tree, cancel).await?;
+    let total_bytes: u64 = tree.files.iter().map(|f| f.size).sum();
+    progress.on_progress(0, total_bytes);
+
+    // 업로드 대상이 하나도 없으면 대상 폴더 마커만 만들고 끝낸다.
+    if !has_content {
+        if cancel.is_cancelled() {
+            return Err(cancelled_error());
+        }
+        backend.create_dir(&target_prefix).await?;
+        return Ok(FolderUpload {
+            uploaded: 0,
+            ignored: tree.ignored,
+            skipped: 0,
+            total_bytes: 0,
+        });
+    }
+
+    // 파일별 최종 키를 확정한다(KeepBoth는 여기서 이름을 고른다).
+    let jobs = resolve_upload_jobs(backend, &tree, &target_prefix, mode, opts).await?;
+
+    // 내용이 없는 디렉터리의 폴더 마커를 만든다. 순차 실행이지만
+    // 마커 수는 디렉터리 수에 불과해 동시성 제한 없이 처리한다.
+    for rel in &tree.markers {
+        if cancel.is_cancelled() {
+            return Err(cancelled_error());
+        }
+        backend
+            .create_dir(&format!("{target_prefix}{rel}/"))
+            .await?;
+    }
+
+    run_upload_jobs(
+        backend,
+        jobs,
+        mode,
+        opts,
+        tree.ignored,
+        total_bytes,
+        progress,
+        cancel,
+    )
+    .await
+}
+
+/// parent 아래 names 중 이미 존재하는 항목만 반환한다(stat 기준).
+/// 파일 키와 폴더 마커 키를 모두 확인하고, 없는 이름은 결과에서 빠진다.
+pub async fn existing<B>(backend: &B, parent: &str, names: &[String]) -> Result<Vec<Item>, Error>
+where
+    B: Backend + Send + Sync,
+{
+    let parent = key::normalize_prefix(parent);
+    let mut seen = HashSet::with_capacity(names.len());
+    let mut found = Vec::new();
+    for name in names {
+        if name.is_empty() || name.contains('/') || !seen.insert(name.as_str()) {
+            continue;
+        }
+        for is_dir in [false, true] {
+            let k = key::child_key(&parent, name, is_dir);
+            match backend.stat(&k).await {
+                Ok(item) => {
+                    found.push(item);
+                    break;
+                }
+                Err(Error::NotFound(_)) => {}
+                Err(e) => return Err(e),
+            }
+        }
+    }
+    Ok(found)
+}
+
+/// 멀티파트 파트 크기: max(16MB, ceil(size/10,000)을 1MB 단위 올림).
+/// S3 멀티파트는 파트가 최대 10,000개·각 5GB 미만이어야 한다.
+fn part_size_for(size: u64) -> u64 {
+    const MIN_PART: u64 = 16 * 1024 * 1024;
+    const MAX_PARTS: u64 = 10_000;
+    const MIB: u64 = 1024 * 1024;
+    let needed = size.div_ceil(MAX_PARTS);
+    let rounded = needed.div_ceil(MIB) * MIB;
+    MIN_PART.max(rounded)
+}
+
+/// UploadMode를 WriteCondition으로 변환한다.
+fn mode_condition(mode: &UploadMode) -> WriteCondition {
+    match mode {
+        UploadMode::Fail | UploadMode::KeepBoth => WriteCondition::NotExists,
+        UploadMode::Replace { if_match } => match if_match {
+            Some(etag) => WriteCondition::IfMatch(etag.clone()),
+            None => WriteCondition::Any,
+        },
+    }
+}
+
+/// KeepBoth일 때만 원격 목록으로 비어 있는 이름을 고른다.
+/// 나머지 모드는 요청된 이름을 그대로 쓴다.
+async fn resolve_name<B>(
+    backend: &B,
+    parent: &str,
+    name: &str,
+    mode: &UploadMode,
+) -> Result<String, Error>
+where
+    B: Backend + Send + Sync,
+{
+    if !matches!(mode, UploadMode::KeepBoth) {
+        return Ok(name.to_string());
+    }
+    let taken: HashSet<String> = backend
+        .list_folder(parent)
+        .await?
+        .iter()
+        .map(|i| i.name.clone())
+        .collect();
+    Ok(key::available_name(&taken, name))
+}
+
+/// 로컬 디렉터리 스캔 결과.
+#[derive(Default)]
+struct LocalTree {
+    /// 업로드할 파일. rel은 src_dir 기준 '/' 구분 상대 경로.
+    files: Vec<LocalFile>,
+    /// 내용이 없는 디렉터리의 rel 경로('/' 없음, 마커 생성용).
+    markers: Vec<String>,
+    /// 제외 규칙·심볼릭 링크로 건너뛴 항목 수.
+    ignored: u64,
+}
+
+struct LocalFile {
+    path: PathBuf,
+    /// src_dir 기준 상대 경로('/' 구분, 디렉터리 포함 가능).
+    rel: String,
+    size: u64,
+}
+
+/// dir 아래를 재귀 스캔한다. 이 디렉터리의 내용 중 업로드 대상(파일,
+/// 내용 있는 하위 디렉터리, 마커가 필요한 빈 디렉터리)이 하나라도
+/// 있으면 true를 반환한다. rel_prefix는 현재 dir의 상대 경로 접두사
+/// ('/'로 끝남, 루트는 "").
+async fn scan_dir(
+    dir: &Path,
+    rel_prefix: &str,
+    tree: &mut LocalTree,
+    cancel: &CancelToken,
+) -> Result<bool, Error> {
+    let mut entries = Vec::new();
+    let mut rd = tokio::fs::read_dir(dir).await?;
+    while let Some(entry) = rd.next_entry().await? {
+        entries.push(entry);
+    }
+    entries.sort_by_key(|e| e.file_name());
+
+    let mut produced = false;
+    for entry in entries {
+        if cancel.is_cancelled() {
+            return Err(cancelled_error());
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if ignore::is_ignored(&name, &[]) {
+            tree.ignored += 1;
+            continue;
+        }
+        let file_type = entry.file_type().await?;
+        let rel = format!("{rel_prefix}{name}");
+        if file_type.is_symlink() || (!file_type.is_dir() && !file_type.is_file()) {
+            // 심볼릭 링크는 따라가지 않고, 일반 파일·디렉터리가 아닌
+            // 특수 파일도 업로드할 수 없어 건너뛴다.
+            tree.ignored += 1;
+            continue;
+        }
+        if file_type.is_dir() {
+            // 재귀 async fn은 미래 크기가 무한대라 Box::pin으로 끊는다.
+            let child_has =
+                Box::pin(scan_dir(&entry.path(), &format!("{rel}/"), tree, cancel)).await?;
+            if !child_has {
+                // 내용이 없는 디렉터리는 폴더 마커로 보존한다.
+                tree.markers.push(rel.clone());
+            }
+        } else {
+            let size = entry.metadata().await?.len();
+            tree.files.push(LocalFile {
+                path: entry.path(),
+                rel,
+                size,
+            });
+        }
+        produced = true;
+    }
+    Ok(produced)
+}
+
+/// 파일별 업로드 작업.
+struct UploadJob {
+    src: PathBuf,
+    remote_key: String,
+    size: u64,
+    /// 이 파일이 잡는 세마포어 허가 수(파트 수 상한, 1~concurrency).
+    weight: u32,
+    /// put_file이 쓰는 진행 바이트. 부모 태스크가 합산해 보고한다.
+    slot: Arc<AtomicU64>,
+}
+
+/// 파일 작업 목록을 만들고 KeepBoth 이름을 확정한다.
+async fn resolve_upload_jobs<B>(
+    backend: &B,
+    tree: &LocalTree,
+    target_prefix: &str,
+    mode: &UploadMode,
+    opts: &TransferOptions,
+) -> Result<Vec<UploadJob>, Error>
+where
+    B: Backend + Send + Sync,
+{
+    // 각 파일의 (원격 부모 접두사, 파일 이름, 기본 키).
+    struct Pending {
+        src: PathBuf,
+        parent_prefix: String,
+        name: String,
+        base_key: String,
+        size: u64,
+    }
+    let mut pending = Vec::with_capacity(tree.files.len());
+    for f in &tree.files {
+        // rel의 마지막 '/' 기준으로 부모 접두사와 이름을 나눈다.
+        let (dir_rel, name) = match f.rel.rfind('/') {
+            Some(i) => (&f.rel[..=i], &f.rel[i + 1..]),
+            None => ("", f.rel.as_str()),
+        };
+        let parent_prefix = format!("{target_prefix}{dir_rel}");
+        pending.push(Pending {
+            src: f.path.clone(),
+            parent_prefix,
+            name: name.to_string(),
+            base_key: format!("{target_prefix}{}", f.rel),
+            size: f.size,
+        });
+    }
+
+    // KeepBoth: 원격 부모 접두사별 점유 이름 집합을 미리 읽는다.
+    let mut taken_by_prefix: HashMap<String, HashSet<String>> = HashMap::new();
+    if matches!(mode, UploadMode::KeepBoth) {
+        let mut prefixes: Vec<String> = pending.iter().map(|p| p.parent_prefix.clone()).collect();
+        prefixes.sort();
+        prefixes.dedup();
+        for prefix in prefixes {
+            let taken: HashSet<String> = backend
+                .list_folder(&prefix)
+                .await?
+                .iter()
+                .map(|i| i.name.clone())
+                .collect();
+            taken_by_prefix.insert(prefix, taken);
+        }
+    }
+
+    // 이름을 순서대로 확정한다. 확정한 이름은 taken에 넣어 같은 배치의
+    // 다른 파일과도 충돌하지 않게 한다.
+    let mut jobs = Vec::with_capacity(pending.len());
+    for p in pending {
+        let remote_key = if matches!(mode, UploadMode::KeepBoth) {
+            let taken = taken_by_prefix
+                .get_mut(&p.parent_prefix)
+                .expect("KeepBoth 접두사 집합이 없다");
+            let resolved = key::available_name(taken, &p.name);
+            taken.insert(resolved.clone());
+            format!("{}{resolved}", p.parent_prefix)
+        } else {
+            p.base_key
+        };
+        jobs.push(UploadJob {
+            src: p.src,
+            remote_key,
+            size: p.size,
+            weight: upload_weight(p.size, opts.concurrency),
+            slot: Arc::new(AtomicU64::new(0)),
+        });
+    }
+    Ok(jobs)
+}
+
+/// 파일 하나가 잡아야 할 세마포어 허가 수.
+/// 단일 PUT은 1, 멀티파트는 min(파트 수, concurrency)다. 허가 수만큼
+/// 파트 동시 업로드 수도 제한되므로 총 요청 수가 concurrency를 넘지 않는다.
+fn upload_weight(size: u64, concurrency: usize) -> u32 {
+    let part = part_size_for(size);
+    if size <= part {
+        return 1;
+    }
+    let parts = size.div_ceil(part);
+    parts.min(concurrency.max(1) as u64).min(u32::MAX as u64) as u32
+}
+
+/// 파일별 진행률 슬롯. put_file이 파트 완료마다 누적 바이트를 쓰고
+/// 부모 태스크가 주기적으로 합산해 ProgressSink에 보고한다.
+#[derive(Default)]
+struct SlotProgress {
+    done: Arc<AtomicU64>,
+}
+
+impl ProgressSink for SlotProgress {
+    fn on_progress(&self, transferred: u64, _total: u64) {
+        self.done.store(transferred, Ordering::SeqCst);
+    }
+}
+
+/// 파일 업로드 작업들을 공유 세마포어로 실행하고 진행률을 합산 보고한다.
+/// Conflict는 mode에 따라 파일 단위로 건너뛴다(Fail·KeepBoth → skipped,
+/// Replace는 전체 실패). 그 외 오류·취소는 남은 작업을 중단한다.
+#[allow(clippy::too_many_arguments)]
+async fn run_upload_jobs<B>(
+    backend: &B,
+    jobs: Vec<UploadJob>,
+    mode: &UploadMode,
+    opts: &TransferOptions,
+    ignored: u64,
+    total_bytes: u64,
+    progress: &dyn ProgressSink,
+    cancel: &CancelToken,
+) -> Result<FolderUpload, Error>
+where
+    B: Backend + Clone + Send + Sync + 'static,
+{
+    let skip_on_conflict = matches!(mode, UploadMode::Fail | UploadMode::KeepBoth);
+    let condition = mode_condition(mode);
+    let sem = Arc::new(Semaphore::new(opts.concurrency.max(1)));
+    let uploaded = Arc::new(AtomicU64::new(0));
+    let skipped = Arc::new(AtomicU64::new(0));
+    // 진행률 합산용으로 슬롯 Arc를 spawn 전에 모아 둔다.
+    let slots: Vec<Arc<AtomicU64>> = jobs.iter().map(|j| Arc::clone(&j.slot)).collect();
+    let mut set = JoinSet::new();
+
+    for job in jobs {
+        let backend = backend.clone();
+        let cancel = cancel.clone();
+        let sem = Arc::clone(&sem);
+        let uploaded = Arc::clone(&uploaded);
+        let skipped = Arc::clone(&skipped);
+        let popts = PutOptions {
+            condition: condition.clone(),
+            part_size: part_size_for(job.size),
+            concurrency: job.weight as usize,
+        };
+        set.spawn(async move {
+            // 이 파일의 예상 파트 수만큼 허가를 잡는다. 허가 수 =
+            // min(파트 수, concurrency)라 총 동시 요청이 상한을 넘지 않는다.
+            let _permit = sem
+                .acquire_many(job.weight)
+                .await
+                .map_err(|e| Error::Other(format!("전송 세마포어 오류: {e}")))?;
+            let sink = SlotProgress {
+                done: Arc::clone(&job.slot),
+            };
+            match backend
+                .put_file(&job.remote_key, &job.src, popts, &sink, &cancel)
+                .await
+            {
+                Ok(()) => {
+                    uploaded.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                }
+                Err(Error::Conflict(_)) if skip_on_conflict => {
+                    skipped.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                }
+                Err(e) => Err(e),
+            }
+        });
+    }
+
+    // 진행률은 슬롯 합산을 100ms마다 보고한다.
+    let mut tick = tokio::time::interval(std::time::Duration::from_millis(100));
+    loop {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                set.abort_all();
+                return Err(cancelled_error());
+            }
+            _ = tick.tick() => {
+                let done: u64 = slots.iter().map(|s| s.load(Ordering::SeqCst)).sum();
+                progress.on_progress(done, total_bytes);
+            }
+            joined = set.join_next() => {
+                match joined {
+                    None => break,
+                    Some(Ok(Ok(()))) => {}
+                    Some(Ok(Err(err))) => {
+                        set.abort_all();
+                        return Err(err);
+                    }
+                    Some(Err(err)) => {
+                        set.abort_all();
+                        return Err(Error::Other(format!("업로드 작업 실패: {err}")));
+                    }
+                }
+            }
+        }
+    }
+    let done: u64 = slots.iter().map(|s| s.load(Ordering::SeqCst)).sum();
+    progress.on_progress(done, total_bytes);
+    Ok(FolderUpload {
+        uploaded: uploaded.load(Ordering::SeqCst),
+        ignored,
+        skipped: skipped.load(Ordering::SeqCst),
+        total_bytes,
+    })
 }
 
 #[cfg(test)]
@@ -1245,5 +1773,390 @@ mod tests {
             .expect_err("루트는 거부돼야 한다");
             assert!(matches!(err, Error::Other(_)), "{err:?}");
         }
+    }
+
+    // ===== 업로드 단위 테스트 =====
+
+    /// 업로드 테스트용 가짜 백엔드.
+    /// put_file이 WriteCondition을 실제로 검사해 Conflict를 재현하고,
+    /// 성공하면 objects에 Item을 기록한다. create_dir은 dirs에 기록한다.
+    #[derive(Clone, Default)]
+    struct FakeUploadBackend {
+        objects: Arc<Mutex<HashMap<String, Item>>>,
+        /// (키, 바이트) — put_file 호출 기록.
+        puts: Arc<Mutex<Vec<(String, u64)>>>,
+        /// create_dir 호출 기록.
+        dirs: Arc<Mutex<Vec<String>>>,
+        /// list_folder이 돌려줄 추가 항목.
+        list_items: Arc<Mutex<Vec<Item>>>,
+    }
+
+    impl FakeUploadBackend {
+        fn seed(&self, key: &str, size: u64, etag: Option<&str>) {
+            self.objects.lock().unwrap().insert(
+                key.to_string(),
+                Item::file(key, size, etag.map(str::to_string), None),
+            );
+        }
+
+        fn put_keys(&self) -> Vec<String> {
+            self.puts
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(k, _)| k.clone())
+                .collect()
+        }
+    }
+
+    impl Backend for FakeUploadBackend {
+        async fn list_folder(&self, _prefix: &str) -> Result<Vec<Item>, Error> {
+            let mut items: Vec<Item> = self
+                .objects
+                .lock()
+                .unwrap()
+                .values()
+                .cloned()
+                .chain(self.list_items.lock().unwrap().iter().cloned())
+                .collect();
+            items.sort_by(|a, b| a.key.cmp(&b.key));
+            Ok(items)
+        }
+
+        async fn list_recursive(&self, _prefix: &str) -> Result<Vec<Item>, Error> {
+            Ok(vec![])
+        }
+
+        async fn stat(&self, key: &str) -> Result<Item, Error> {
+            self.objects
+                .lock()
+                .unwrap()
+                .get(key)
+                .cloned()
+                .ok_or_else(|| Error::NotFound(key.to_string()))
+        }
+
+        async fn create_dir(&self, key: &str) -> Result<(), Error> {
+            self.dirs.lock().unwrap().push(key.to_string());
+            Ok(())
+        }
+
+        async fn put_file(
+            &self,
+            key: &str,
+            src: &Path,
+            opts: PutOptions,
+            _progress: &dyn ProgressSink,
+            _cancel: &CancelToken,
+        ) -> Result<(), Error> {
+            let size = tokio::fs::metadata(src).await?.len();
+            {
+                let objects = self.objects.lock().unwrap();
+                match &opts.condition {
+                    WriteCondition::Any => {}
+                    WriteCondition::NotExists => {
+                        if objects.contains_key(key) {
+                            return Err(Error::Conflict(format!("{key}가 이미 있다")));
+                        }
+                    }
+                    WriteCondition::IfMatch(etag) => {
+                        let ok =
+                            objects.get(key).and_then(|i| i.etag.as_deref()) == Some(etag.as_str());
+                        if !ok {
+                            return Err(Error::Conflict(format!("{key}의 ETag가 다르다")));
+                        }
+                    }
+                }
+            }
+            self.puts.lock().unwrap().push((key.to_string(), size));
+            self.objects.lock().unwrap().insert(
+                key.to_string(),
+                Item::file(key, size, Some("etag".to_string()), None),
+            );
+            Ok(())
+        }
+    }
+
+    fn write_src(dir: &TempDir, name: &str, data: &[u8]) -> PathBuf {
+        let path = dir.dest(name);
+        std::fs::write(&path, data).unwrap();
+        path
+    }
+
+    #[test]
+    fn part_size_for_cases() {
+        const MIB: u64 = 1024 * 1024;
+        const MIN_PART: u64 = 16 * MIB;
+        assert_eq!(part_size_for(0), MIN_PART);
+        assert_eq!(part_size_for(MIN_PART), MIN_PART);
+        // 16MB+1 → 16MB 파트 2개.
+        assert_eq!(part_size_for(MIN_PART + 1), MIN_PART);
+        // 5.1GB → 16MB 파트, 파트 수 ≤ 10,000.
+        let gb51 = 5_368_709_120u64;
+        assert_eq!(part_size_for(gb51), MIN_PART);
+        assert!(gb51.div_ceil(part_size_for(gb51)) <= 10_000);
+        // 160GB 경계 → 파트 수가 정확히 10,000 이하.
+        let gb160 = 160 * 1024 * MIB;
+        assert!(gb160.div_ceil(part_size_for(gb160)) <= 10_000);
+        // 1TB → 파트가 1MB 단위로 커져 파트 수 ≤ 10,000.
+        let tb = 1u64 << 40;
+        let ps = part_size_for(tb);
+        assert_eq!(ps % MIB, 0);
+        assert!(ps >= MIN_PART);
+        assert!(tb.div_ceil(ps) <= 10_000);
+    }
+
+    #[test]
+    fn upload_weight_cases() {
+        const MIB: u64 = 1024 * 1024;
+        // 작은 파일은 단일 PUT → 허가 1.
+        assert_eq!(upload_weight(100, 8), 1);
+        // 20MB → 16MB 파트 2개 → min(2, 8) = 2.
+        assert_eq!(upload_weight(20 * MIB, 8), 2);
+        // 동시성 1이면 허가도 1.
+        assert_eq!(upload_weight(20 * MIB, 1), 1);
+        // 큰 파일은 파트 수와 동시성 중 작은 쪽.
+        assert_eq!(upload_weight(160 * 1024 * MIB, 4), 4);
+    }
+
+    #[tokio::test]
+    async fn upload_fail_mode_conflict_on_existing() {
+        let backend = FakeUploadBackend::default();
+        let dir = TempDir::new("upfail");
+        let src = write_src(&dir, "a.txt", b"hello");
+        let opts = opts(8, 2);
+        let progress = RecProgress::default();
+        let cancel = CancelToken::new();
+
+        let item = upload(
+            &backend,
+            &src,
+            "docs/",
+            "a.txt",
+            &UploadMode::Fail,
+            &opts,
+            &progress,
+            &cancel,
+        )
+        .await
+        .unwrap();
+        assert_eq!(item.key, "docs/a.txt");
+        assert_eq!(item.size, 5);
+
+        // 같은 이름을 다시 올리면 Conflict.
+        let err = upload(
+            &backend,
+            &src,
+            "docs/",
+            "a.txt",
+            &UploadMode::Fail,
+            &opts,
+            &progress,
+            &cancel,
+        )
+        .await
+        .expect_err("Conflict여야 한다");
+        assert!(matches!(err, Error::Conflict(_)), "{err:?}");
+        assert_eq!(backend.put_keys(), vec!["docs/a.txt"]);
+    }
+
+    #[tokio::test]
+    async fn upload_keep_both_picks_free_name() {
+        let backend = FakeUploadBackend::default();
+        backend.seed("docs/a.txt", 3, Some("e0"));
+        let dir = TempDir::new("upkeep");
+        let src = write_src(&dir, "a.txt", b"new!");
+        let item = upload(
+            &backend,
+            &src,
+            "docs/",
+            "a.txt",
+            &UploadMode::KeepBoth,
+            &opts(8, 2),
+            &RecProgress::default(),
+            &CancelToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(item.key, "docs/a (2).txt");
+        assert_eq!(backend.put_keys(), vec!["docs/a (2).txt"]);
+    }
+
+    #[tokio::test]
+    async fn upload_replace_if_match() {
+        let backend = FakeUploadBackend::default();
+        backend.seed("docs/a.txt", 3, Some("e1"));
+        let dir = TempDir::new("uprep");
+        let src = write_src(&dir, "a.txt", b"new!");
+        let opts = opts(8, 2);
+        let cancel = CancelToken::new();
+
+        // ETag가 일치하면 성공.
+        upload(
+            &backend,
+            &src,
+            "docs/",
+            "a.txt",
+            &UploadMode::Replace {
+                if_match: Some("e1".to_string()),
+            },
+            &opts,
+            &RecProgress::default(),
+            &cancel,
+        )
+        .await
+        .unwrap();
+
+        // ETag가 다르면 Conflict(쓰기 자체는 실패해 원본 유지).
+        let err = upload(
+            &backend,
+            &src,
+            "docs/",
+            "a.txt",
+            &UploadMode::Replace {
+                if_match: Some("e0".to_string()),
+            },
+            &opts,
+            &RecProgress::default(),
+            &cancel,
+        )
+        .await
+        .expect_err("Conflict여야 한다");
+        assert!(matches!(err, Error::Conflict(_)), "{err:?}");
+
+        // if_match=None은 무조건 덮어쓴다.
+        upload(
+            &backend,
+            &src,
+            "docs/",
+            "a.txt",
+            &UploadMode::Replace { if_match: None },
+            &opts,
+            &RecProgress::default(),
+            &cancel,
+        )
+        .await
+        .unwrap();
+        assert_eq!(backend.put_keys().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn existing_returns_only_present_items() {
+        let backend = FakeUploadBackend::default();
+        backend.seed("p/a.txt", 1, None);
+        backend.seed("p/b.txt", 1, None);
+        // 폴더 마커도 "있는 항목"으로 본다.
+        backend
+            .objects
+            .lock()
+            .unwrap()
+            .insert("p/dir/".to_string(), Item::folder("p/dir/"));
+        let found = existing(
+            &backend,
+            "p/",
+            &[
+                "a.txt".to_string(),
+                "b.txt".to_string(),
+                "none".to_string(),
+                "dir".to_string(),
+            ],
+        )
+        .await
+        .unwrap();
+        let keys: Vec<&str> = found.iter().map(|i| i.key.as_str()).collect();
+        assert_eq!(keys, vec!["p/a.txt", "p/b.txt", "p/dir/"]);
+    }
+
+    #[tokio::test]
+    async fn upload_folder_uploads_tree_and_markers() {
+        let backend = FakeUploadBackend::default();
+        let dir = TempDir::new("upfolder");
+        let src_dir = dir.0.join("srcdir");
+        std::fs::create_dir_all(src_dir.join("sub")).unwrap();
+        std::fs::create_dir_all(src_dir.join("empty")).unwrap();
+        std::fs::write(src_dir.join("a.txt"), b"aaa").unwrap();
+        std::fs::write(src_dir.join(".DS_Store"), b"junk").unwrap();
+        std::fs::write(src_dir.join("sub/b.txt"), b"bb").unwrap();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(src_dir.join("a.txt"), src_dir.join("link")).unwrap();
+        }
+
+        let result = upload_folder(
+            &backend,
+            &src_dir,
+            "up/",
+            &UploadMode::Fail,
+            &opts(8, 2),
+            &RecProgress::default(),
+            &CancelToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.uploaded, 2);
+        assert_eq!(result.total_bytes, 5);
+        // .DS_Store와 심볼릭 링크는 무시된다.
+        assert_eq!(result.ignored, 2);
+        let mut keys = backend.put_keys();
+        keys.sort();
+        assert_eq!(keys, vec!["up/srcdir/a.txt", "up/srcdir/sub/b.txt"]);
+        // 빈 디렉터리는 폴더 마커로 만든다.
+        assert_eq!(
+            backend.dirs.lock().unwrap().as_slice(),
+            ["up/srcdir/empty/"]
+        );
+    }
+
+    #[tokio::test]
+    async fn upload_folder_fail_mode_skips_conflicts() {
+        let backend = FakeUploadBackend::default();
+        backend.seed("up/srcdir/a.txt", 3, None);
+        let dir = TempDir::new("upfolderfail");
+        let src_dir = dir.0.join("srcdir");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::write(src_dir.join("a.txt"), b"aaa").unwrap();
+        std::fs::write(src_dir.join("b.txt"), b"b").unwrap();
+
+        let result = upload_folder(
+            &backend,
+            &src_dir,
+            "up/",
+            &UploadMode::Fail,
+            &opts(8, 2),
+            &RecProgress::default(),
+            &CancelToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.uploaded, 1);
+        assert_eq!(result.skipped, 1);
+        assert_eq!(backend.put_keys(), vec!["up/srcdir/b.txt"]);
+    }
+
+    #[tokio::test]
+    async fn upload_folder_empty_dir_creates_marker_only() {
+        let backend = FakeUploadBackend::default();
+        let dir = TempDir::new("upempty");
+        let src_dir = dir.0.join("emptydir");
+        std::fs::create_dir_all(&src_dir).unwrap();
+
+        let result = upload_folder(
+            &backend,
+            &src_dir,
+            "up/",
+            &UploadMode::Fail,
+            &opts(8, 2),
+            &RecProgress::default(),
+            &CancelToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.uploaded, 0);
+        assert_eq!(result.total_bytes, 0);
+        assert!(backend.put_keys().is_empty());
+        assert_eq!(backend.dirs.lock().unwrap().as_slice(), ["up/emptydir/"]);
     }
 }

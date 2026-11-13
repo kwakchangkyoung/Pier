@@ -18,6 +18,9 @@ final class BrowserModel {
     /// 다운로드에 사용하는 열려 있는 코어 연결. open 성공 후에만 non-nil.
     private(set) var connection: PierConnection?
 
+    /// 연결 설정의 쓰기 권한. false면 업로드·이름 변경·이동·삭제 UI를 비활성화한다.
+    let canWrite: Bool
+
     /// 현재 폴더의 항목. 키 순(코어가 주는 순서)으로 정렬돼 있다.
     private(set) var entries: [PierEntry] = []
     private(set) var phase: Phase = .idle
@@ -39,9 +42,15 @@ final class BrowserModel {
     /// 백그라운드 refresh 세대 번호. 취소된 이전 작업이 플래그를 건드리지 않게 한다.
     private var refreshGeneration = 0
 
-    init(connectionId: UUID, title: String, connectionProvider: @escaping () throws -> PierConnection) {
+    init(
+        connectionId: UUID,
+        title: String,
+        canWrite: Bool = true,
+        connectionProvider: @escaping () throws -> PierConnection
+    ) {
         self.connectionId = connectionId
         self.title = title
+        self.canWrite = canWrite
         self.connectionProvider = connectionProvider
     }
 
@@ -125,7 +134,22 @@ final class BrowserModel {
             phase = .failed(PierErrorPresenter.message(for: error) ?? "연결을 열 수 없습니다.")
             return
         }
+        await resumePendingOps()
         await loadPages()
+    }
+
+    /// 중단됐던 폴더 이름 변경 등 보류 작업을 재개한다(SPEC 3.4).
+    /// 처리된 건수가 있으면 로그를 남기고, 목록은 이어지는 loadPages가 새로 가져온다.
+    private func resumePendingOps() async {
+        guard let conn = connection else { return }
+        do {
+            let resumed = try await conn.resumePendingOps()
+            if resumed > 0 {
+                Log.app.info("보류 작업 \(resumed)건을 재개했습니다")
+            }
+        } catch {
+            Log.app.error("resumePendingOps 실패: \(PierErrorPresenter.categoryName(of: error))")
+        }
     }
 
     /// listPage를 커서 끝까지 따라가며 전체 목록을 모은다.
@@ -204,5 +228,35 @@ final class BrowserModel {
             byId[entry.identifier] = entry
         }
         entries = byId.values.sorted { $0.identifier < $1.identifier }
+    }
+
+    // MARK: - 쓰기 결과 반영 (BrowserModel+Write.swift에서 사용)
+
+    /// 쓰기 작업 결과를 현재 목록에 즉시 반영하고 백그라운드 refresh를 시작한다.
+    /// upserted 항목은 현재 폴더 것이 아니면 무시한다(다른 폴더에 올린 경우 등).
+    func applyWriteResults(removed identifiers: [String] = [], upserted newEntries: [PierEntry] = []) {
+        if !identifiers.isEmpty {
+            entries.removeAll { identifiers.contains($0.identifier) }
+        }
+        for entry in newEntries where belongsToCurrentFolder(entry) {
+            upsert(entry)
+        }
+        entries.sort { $0.identifier < $1.identifier }
+        if let conn = connection {
+            startRefresh(folder: currentFolder, connection: conn)
+        }
+    }
+
+    /// 항목의 부모 폴더가 현재 폴더인지 여부.
+    func belongsToCurrentFolder(_ entry: PierEntry) -> Bool {
+        RemoteKey.parent(of: entry.identifier) == currentFolder
+    }
+
+    private func upsert(_ entry: PierEntry) {
+        if let index = entries.firstIndex(where: { $0.identifier == entry.identifier }) {
+            entries[index] = entry
+        } else {
+            entries.append(entry)
+        }
     }
 }

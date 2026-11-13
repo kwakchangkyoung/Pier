@@ -2,14 +2,29 @@ import AppKit
 import SwiftUI
 
 /// S3 목록을 보여주는 NSTableView 래퍼.
-/// 다중 선택, 폴더 더블클릭 진입, 우클릭 메뉴를 지원한다.
+/// 데이터 소스/델리게이트는 FileTableCoordinator, 드래그 앤 드롭은
+/// FileTableDragDrop extension이 담당한다.
 struct FileTableView: NSViewRepresentable {
     let entries: [PierEntry]
     @Binding var selection: Set<String>
+    /// 행 위가 아닌 곳에 드롭했을 때의 대상 부모 폴더 키(현재 폴더).
+    let currentParent: String
+    /// 읽기 전용 연결이면 이름 변경/삭제를 비활성화한다.
+    let canWrite: Bool
     /// 폴더 더블클릭 시 호출.
     let onOpenFolder: @MainActor (PierEntry) -> Void
     /// 우클릭 메뉴에서 선택 항목을 넘길 때 호출.
     let onDownload: @MainActor ([PierEntry]) -> Void
+    /// 우클릭/Return으로 단일 항목 이름 변경을 요청할 때 호출.
+    let onRename: @MainActor (PierEntry) -> Void
+    /// 우클릭/⌘⌫으로 선택 항목 삭제를 요청할 때 호출.
+    let onDelete: @MainActor ([PierEntry]) -> Void
+    /// 앱 내부 이동 드롭: 항목 키들을 toParent 폴더로 옮긴다.
+    let onMoveKeys: @MainActor ([String], String) -> Void
+    /// Finder 파일 드롭: 로컬 URL들을 toParent 폴더로 업로드한다.
+    let onUploadURLs: @MainActor ([URL], String) -> Void
+    /// 행을 Finder로 끌 때 파일 프로미스 핸들러를 만든다. nil이면 드래그 불가.
+    let makePromiseHandler: @MainActor (PierEntry) -> PromiseDownloadHandler?
 
     func makeCoordinator() -> Coordinator {
         Coordinator(parent: self)
@@ -21,7 +36,7 @@ struct FileTableView: NSViewRepresentable {
         scrollView.autohidesScrollers = true
         scrollView.drawsBackground = false
 
-        let tableView = NSTableView()
+        let tableView = BrowserTableView()
         tableView.style = .fullWidth
         tableView.usesAutomaticRowHeights = true
         tableView.allowsMultipleSelection = true
@@ -39,19 +54,23 @@ struct FileTableView: NSViewRepresentable {
         tableView.target = context.coordinator
         tableView.doubleAction = #selector(Coordinator.handleDoubleClick(_:))
 
+        // 내부 이동은 .move, 외부(Finder) 드롭은 모든 연산을 허용한다.
+        tableView.setDraggingSourceOperationMask(.move, forLocal: true)
+        tableView.setDraggingSourceOperationMask(.every, forLocal: false)
+        // 내부 이동 마커(com.yourname.pier.entry-keys)와 Finder 파일 URL을 받는다.
+        tableView.registerForDraggedTypes([PierDragTypes.entryKeys, .fileURL])
+
         let menu = NSMenu()
-        let downloadItem = NSMenuItem(
-            title: "다운로드",
-            action: #selector(Coordinator.downloadSelected(_:)),
-            keyEquivalent: ""
-        )
-        downloadItem.target = context.coordinator
-        menu.addItem(downloadItem)
+        menu.addItem(menuItem("다운로드", #selector(Coordinator.downloadSelected(_:)), target: context.coordinator))
+        menu.addItem(.separator())
+        menu.addItem(menuItem("이름 변경", #selector(Coordinator.renameSelected(_:)), target: context.coordinator))
+        menu.addItem(menuItem("삭제", #selector(Coordinator.deleteSelected(_:)), target: context.coordinator))
         menu.delegate = context.coordinator
         tableView.menu = menu
 
-        scrollView.documentView = tableView
         context.coordinator.tableView = tableView
+        context.coordinator.installKeyHandlers(on: tableView)
+        scrollView.documentView = tableView
         return scrollView
     }
 
@@ -61,9 +80,10 @@ struct FileTableView: NSViewRepresentable {
         context.coordinator.sync(entries: entries, selection: selection, tableView: tableView)
     }
 
-    // MARK: - 컬럼
+    // MARK: - 컬럼/메뉴
 
-    private enum ColumnID: String {
+    /// FileTableCoordinator의 셀 구성에서도 쓰므로 internal이다.
+    enum ColumnID: String {
         case name
         case size
         case modified
@@ -86,182 +106,9 @@ struct FileTableView: NSViewRepresentable {
         ]
     }
 
-    // MARK: - Coordinator
-
-    /// NSTableView 데이터 소스/델리게이트. AppKit 콜백은 모두 메인 스레드에서 온다.
-    final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate, NSMenuDelegate {
-        var parent: FileTableView
-        weak var tableView: NSTableView?
-        private var entries: [PierEntry] = []
-        private var lastSelection: Set<String> = []
-        /// reloadData/프로그램적 선택 변경 중에는 selectionDidChange를 무시한다.
-        private var isSyncingSelection = false
-
-        init(parent: FileTableView) {
-            self.parent = parent
-        }
-
-        // MARK: 데이터 소스
-
-        func numberOfRows(in tableView: NSTableView) -> Int {
-            entries.count
-        }
-
-        func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
-            guard let tableColumn, row < entries.count else { return nil }
-            let entry = entries[row]
-            let cellID = NSUserInterfaceItemIdentifier("cell-\(tableColumn.identifier.rawValue)")
-            var cell = tableView.makeView(withIdentifier: cellID, owner: self) as? NSTableCellView
-            if cell == nil {
-                cell = makeCell(for: tableColumn)
-                cell?.identifier = cellID
-            }
-            configure(cell, column: tableColumn.identifier.rawValue, entry: entry)
-            return cell
-        }
-
-        // MARK: 선택 동기화
-
-        /// SwiftUI 상태(entries/selection)를 테이블에 반영한다.
-        func sync(entries newEntries: [PierEntry], selection newSelection: Set<String>, tableView: NSTableView) {
-            let entriesChanged = newEntries != entries
-            entries = newEntries
-            if entriesChanged {
-                isSyncingSelection = true
-                tableView.reloadData()
-                applySelection(newSelection, to: tableView)
-                isSyncingSelection = false
-            } else if newSelection != lastSelection {
-                isSyncingSelection = true
-                applySelection(newSelection, to: tableView)
-                isSyncingSelection = false
-            }
-            lastSelection = newSelection
-        }
-
-        private func applySelection(_ ids: Set<String>, to tableView: NSTableView) {
-            var rows = IndexSet()
-            for (index, entry) in entries.enumerated() where ids.contains(entry.identifier) {
-                rows.insert(index)
-            }
-            tableView.selectRowIndexes(rows, byExtendingSelection: false)
-        }
-
-        func tableViewSelectionDidChange(_ notification: Notification) {
-            guard !isSyncingSelection, let tableView = notification.object as? NSTableView else { return }
-            let ids = Set(
-                tableView.selectedRowIndexes.compactMap { row -> String? in
-                    guard row >= 0, row < entries.count else { return nil }
-                    return entries[row].identifier
-                })
-            lastSelection = ids
-            if ids != parent.selection {
-                parent.selection = ids
-            }
-        }
-
-        // MARK: 더블클릭/컨텍스트 메뉴
-
-        @objc func handleDoubleClick(_ sender: NSTableView) {
-            let row = sender.clickedRow
-            guard row >= 0, row < entries.count else { return }
-            let entry = entries[row]
-            guard entry.isDir else { return }
-            MainActor.assumeIsolated {
-                parent.onOpenFolder(entry)
-            }
-        }
-
-        @objc func downloadSelected(_ sender: Any?) {
-            let entries = selectedEntries()
-            guard !entries.isEmpty else { return }
-            MainActor.assumeIsolated {
-                parent.onDownload(entries)
-            }
-        }
-
-        func menuNeedsUpdate(_ menu: NSMenu) {
-            menu.items.first?.isEnabled = !selectedEntries().isEmpty
-        }
-
-        private func selectedEntries() -> [PierEntry] {
-            guard let tableView else { return [] }
-            return tableView.selectedRowIndexes.compactMap { row in
-                guard row >= 0, row < entries.count else { return nil }
-                return entries[row]
-            }
-        }
-
-        // MARK: 셀 구성
-
-        private func makeCell(for column: NSTableColumn) -> NSTableCellView {
-            let cell = NSTableCellView()
-            if column.identifier.rawValue == ColumnID.name.rawValue {
-                let imageView = NSImageView()
-                imageView.translatesAutoresizingMaskIntoConstraints = false
-                imageView.imageScaling = .scaleProportionallyDown
-                imageView.setContentHuggingPriority(.required, for: .horizontal)
-                let textField = NSTextField(labelWithString: "")
-                textField.translatesAutoresizingMaskIntoConstraints = false
-                textField.lineBreakMode = .byTruncatingMiddle
-                cell.addSubview(imageView)
-                cell.addSubview(textField)
-                NSLayoutConstraint.activate([
-                    imageView.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 6),
-                    imageView.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
-                    imageView.widthAnchor.constraint(equalToConstant: 16),
-                    imageView.heightAnchor.constraint(equalToConstant: 16),
-                    textField.leadingAnchor.constraint(equalTo: imageView.trailingAnchor, constant: 6),
-                    textField.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -6),
-                    textField.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
-                ])
-                imageView.tag = 1
-                textField.tag = 2
-            } else {
-                let textField = NSTextField(labelWithString: "")
-                textField.translatesAutoresizingMaskIntoConstraints = false
-                textField.lineBreakMode = .byTruncatingTail
-                cell.addSubview(textField)
-                NSLayoutConstraint.activate([
-                    textField.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 6),
-                    textField.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -6),
-                    textField.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
-                ])
-                textField.tag = 2
-            }
-            return cell
-        }
-
-        private func configure(_ cell: NSTableCellView?, column: String, entry: PierEntry) {
-            guard let cell, let textField = cell.viewWithTag(2) as? NSTextField else { return }
-            switch column {
-            case ColumnID.name.rawValue:
-                if let imageView = cell.viewWithTag(1) as? NSImageView {
-                    let symbol = entry.isDir ? "folder" : "doc"
-                    imageView.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)
-                }
-                textField.stringValue = entry.name
-                cell.toolTip = entry.identifier
-            case ColumnID.size.rawValue:
-                textField.stringValue =
-                    entry.isDir
-                    ? "—"
-                    : ByteCountFormatter.string(fromByteCount: Int64(entry.size), countStyle: .file)
-                cell.toolTip = nil
-            case ColumnID.modified.rawValue:
-                if let ms = entry.lastModifiedMs {
-                    let date = Date(timeIntervalSince1970: Double(ms) / 1000)
-                    textField.stringValue = date.formatted(date: .abbreviated, time: .shortened)
-                } else {
-                    textField.stringValue = "—"
-                }
-                cell.toolTip = nil
-            case ColumnID.storageClass.rawValue:
-                textField.stringValue = entry.storageClass ?? "—"
-                cell.toolTip = nil
-            default:
-                break
-            }
-        }
+    private func menuItem(_ title: String, _ action: Selector, target: Coordinator) -> NSMenuItem {
+        let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
+        item.target = target
+        return item
     }
 }

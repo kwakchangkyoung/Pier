@@ -1,63 +1,41 @@
 import Foundation
 
-/// 다운로드 항목 하나의 상태.
-struct DownloadItem: Identifiable, Equatable {
-    enum State: Equatable {
-        case downloading
-        case completed
-        case failed(String)
-    }
-
-    let id = UUID()
-    let name: String
-    /// S3 객체 키. 파일은 객체 키, 폴더는 '/'로 끝나는 접두사.
-    let key: String
-    /// 폴더 다운로드 작업인지 여부.
-    let isFolder: Bool
-    var state: State = .downloading
-    var transferred: UInt64 = 0
-    var total: UInt64 = 0
-    /// 초당 바이트. progress 콜백이 올 때마다 갱신한다.
-    var speed: Double = 0
-    /// 완료 시 Finder에서 보기용 로컬 경로.
-    var destinationPath: String?
-    /// 폴더 다운로드 완료 시 받은 파일 수.
-    var fileCount: UInt64 = 0
-}
-
-/// 진행 중인 다운로드를 관리한다. 모든 상태 변경은 메인 액터에서 일어난다.
+/// 진행 중인 전송(업로드/다운로드)을 관리한다. 모든 상태 변경은 메인 액터에서 일어난다.
 @MainActor @Observable
-final class DownloadManager {
-    private(set) var items: [DownloadItem] = []
+final class TransferManager {
+    private(set) var items: [TransferItem] = []
     private var cancelTokens: [UUID: PierCancelToken] = [:]
     /// 속도 계산용 마지막 (전송량, 시각).
     private var lastProgress: [UUID: (bytes: UInt64, at: Date)] = [:]
 
+    // MARK: - 다운로드
+
     /// 선택한 항목들을 directory 아래로 다운로드한다. 파일과 폴더를 섞어 시작할 수 있고
     /// 여러 작업을 동시에 실행할 수 있다.
-    func start(connection: PierConnection, entries: [PierEntry], into directory: URL) {
+    func startDownloads(connection: PierConnection, entries: [PierEntry], into directory: URL) {
         for entry in entries {
             if entry.isDir {
-                startFolder(connection: connection, entry: entry, into: directory)
+                startFolderDownload(connection: connection, entry: entry, into: directory)
             } else {
-                startFile(connection: connection, entry: entry, into: directory)
+                startFileDownload(connection: connection, entry: entry, into: directory)
             }
         }
     }
 
     /// 단일 객체 다운로드.
-    private func startFile(connection: PierConnection, entry: PierEntry, into directory: URL) {
+    private func startFileDownload(connection: PierConnection, entry: PierEntry, into directory: URL) {
         let destination = Self.uniqueDestination(in: directory, name: entry.name)
-        let item = DownloadItem(
+        let item = TransferItem(
             name: entry.name,
             key: entry.identifier,
             isFolder: false,
+            direction: .download,
             total: entry.size,
             destinationPath: destination.path
         )
         let token = begin(item: item)
         let id = item.id
-        let progress = DownloadProgressBridge { [weak self] transferred, total in
+        let progress = ProgressBridge { [weak self] transferred, total in
             Task { @MainActor in
                 self?.recordProgress(id: id, transferred: transferred, total: total)
             }
@@ -79,13 +57,13 @@ final class DownloadManager {
 
     /// 폴더 재귀 다운로드. 코어가 destDir 안에 '<폴더 이름>'을 만들고
     /// 하위 객체를 상대 경로 구조 그대로 저장한다.
-    private func startFolder(connection: PierConnection, entry: PierEntry, into directory: URL) {
+    private func startFolderDownload(connection: PierConnection, entry: PierEntry, into directory: URL) {
         // prefix는 '/'로 끝나는 폴더 키여야 한다(빈 문자열=루트는 코어가 거부).
         let prefix = entry.identifier.hasSuffix("/") ? entry.identifier : entry.identifier + "/"
-        let item = DownloadItem(name: entry.name, key: prefix, isFolder: true)
+        let item = TransferItem(name: entry.name, key: prefix, isFolder: true, direction: .download)
         let token = begin(item: item)
         let id = item.id
-        let progress = DownloadProgressBridge { [weak self] transferred, total in
+        let progress = ProgressBridge { [weak self] transferred, total in
             Task { @MainActor in
                 self?.recordProgress(id: id, transferred: transferred, total: total)
             }
@@ -98,15 +76,18 @@ final class DownloadManager {
                     progress: progress,
                     cancel: token
                 )
-                completeFolder(id: id, result: result)
+                completeFolderDownload(id: id, result: result)
             } catch {
                 fail(id: id, error: error)
             }
         }
     }
 
+    // MARK: - 항목 수명
+
     /// 항목을 목록에 넣고 취소 토큰을 만들어 돌려준다.
-    private func begin(item: DownloadItem) -> PierCancelToken {
+    /// TransferUploads.swift(extension)에서도 쓰므로 internal이다.
+    func begin(item: TransferItem) -> PierCancelToken {
         items.append(item)
         let token = PierCancelToken()
         cancelTokens[item.id] = token
@@ -114,7 +95,7 @@ final class DownloadManager {
     }
 
     /// 폴더 다운로드 완료. 실제 생성 경로·파일 수·전체 바이트를 기록한다.
-    private func completeFolder(id: UUID, result: PierFolderDownload) {
+    private func completeFolderDownload(id: UUID, result: PierFolderDownload) {
         finish(id: id, state: .completed)
         guard let index = items.firstIndex(where: { $0.id == id }) else { return }
         items[index].total = result.totalBytes
@@ -124,7 +105,7 @@ final class DownloadManager {
     }
 
     /// 실패 처리. 취소는 오류로 표시하지 않고 목록에서 지운다.
-    private func fail(id: UUID, error: Error) {
+    func fail(id: UUID, error: Error) {
         guard let message = PierErrorPresenter.message(for: error) else {
             remove(id)
             return
@@ -132,7 +113,7 @@ final class DownloadManager {
         finish(id: id, state: .failed(message))
     }
 
-    /// 진행 중인 다운로드를 취소한다. 항목은 즉시 목록에서 사라진다.
+    /// 진행 중인 전송을 취소한다. 항목은 즉시 목록에서 사라진다.
     /// 코어는 임시 파일에 쓰므로 취소해도 부분 파일이 남지 않는다.
     func cancel(_ id: UUID) {
         cancelTokens[id]?.cancel()
@@ -148,7 +129,7 @@ final class DownloadManager {
 
     // MARK: - 내부
 
-    private func finish(id: UUID, state: DownloadItem.State) {
+    func finish(id: UUID, state: TransferItem.State) {
         guard let index = items.firstIndex(where: { $0.id == id }) else {
             cancelTokens.removeValue(forKey: id)
             lastProgress.removeValue(forKey: id)
@@ -162,9 +143,9 @@ final class DownloadManager {
         lastProgress.removeValue(forKey: id)
     }
 
-    private func recordProgress(id: UUID, transferred: UInt64, total: UInt64) {
+    func recordProgress(id: UUID, transferred: UInt64, total: UInt64) {
         guard let index = items.firstIndex(where: { $0.id == id }),
-            case .downloading = items[index].state
+            case .active = items[index].state
         else { return }
         let now = Date()
         if let last = lastProgress[id] {
@@ -178,6 +159,19 @@ final class DownloadManager {
         if total > 0 {
             items[index].total = total
         }
+    }
+
+    /// 업로드 성공 결과를 항목에 반영하고 완료 상태로 바꾼다.
+    /// 파일은 PierEntry, 폴더는 PierFolderUpload 집계를 기록한다.
+    func completeUploadItem(id: UUID, entry: PierEntry?, folderResult: PierFolderUpload?) {
+        if let folderResult, let index = items.firstIndex(where: { $0.id == id }) {
+            items[index].fileCount = folderResult.uploaded
+            items[index].ignoredCount = folderResult.ignored
+            items[index].skippedCount = folderResult.skipped
+            items[index].total = folderResult.totalBytes
+            items[index].transferred = folderResult.totalBytes
+        }
+        finish(id: id, state: .completed)
     }
 
     /// `이름 (2).확장자` 형태로 대상 폴더에서 비어 있는 파일 이름을 고른다.
@@ -203,7 +197,7 @@ final class DownloadManager {
 
 /// FFI `PierProgress` 구현. Rust가 백그라운드 스레드에서 호출하므로
 /// 0.1초로 스로틀한 뒤 메인 액터로 넘긴다.
-final class DownloadProgressBridge: PierProgress, @unchecked Sendable {
+final class ProgressBridge: PierProgress, @unchecked Sendable {
     private let lock = NSLock()
     private var lastFire = Date.distantPast
     private let handler: @Sendable (UInt64, UInt64) -> Void

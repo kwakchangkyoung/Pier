@@ -39,6 +39,17 @@ pub struct Changes {
     pub removed: Vec<String>,
 }
 
+/// 재시도가 필요한 작업 하나. `payload`는 불투명 문자열이며
+/// 직렬화 형식은 기록하는 쪽(ops)이 정한다.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingOp {
+    pub id: i64,
+    pub kind: String,
+    pub payload: String,
+    /// Unix epoch 밀리초.
+    pub created_at_ms: i64,
+}
+
 /// SQLite 메타데이터 캐시.
 /// 모든 시각 값은 호출자가 Unix epoch 밀리초로 넘긴다.
 pub struct MetadataStore {
@@ -242,6 +253,117 @@ impl MetadataStore {
             params![prefix, now_ms],
         )?;
         Ok(())
+    }
+
+    /// 원격 쓰기(업로드·폴더 생성 등) 결과를 캐시에 즉시 반영한다.
+    ///
+    /// `item.parent`가 가리키는 폴더의 `cached_page`에 바로 나타난다.
+    /// 부모 폴더가 complete가 아니면 어차피 다음 list_folder가 원격에서
+    /// 다시 받아 교체하므로 complete 여부와 무관하게 upsert한다.
+    pub fn upsert_item(&mut self, item: &Item, now_ms: i64) -> Result<(), Error> {
+        // replace_folder와 같은 upsert. S3 객체 크기는 최대 5TB라 i64에 들어간다.
+        self.conn.execute(
+            "INSERT INTO items
+                (key, parent, is_dir, size, etag, last_modified, storage_class, seen_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(key) DO UPDATE SET
+                parent = excluded.parent,
+                is_dir = excluded.is_dir,
+                size = excluded.size,
+                etag = excluded.etag,
+                last_modified = excluded.last_modified,
+                storage_class = excluded.storage_class,
+                seen_at = excluded.seen_at",
+            params![
+                item.key,
+                item.parent,
+                item.is_dir,
+                item.size as i64,
+                item.etag,
+                item.last_modified_ms,
+                item.storage_class,
+                now_ms,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// 키 하나를 캐시에서 지운다. 폴더 키(끝 '/')면 하위 items·folders 행까지
+    /// 함께 지운다(`replace_folder`의 삭제와 같은 범위 비교 방식).
+    /// 없는 키는 아무 일도 하지 않는다.
+    pub fn remove_item(&mut self, key: &str) -> Result<(), Error> {
+        // items에는 끝 '/'가 붙은 폴더 키만 들어가므로(루트 ""는 항목이 아니다)
+        // is_folder 대신 ends_with('/')로 판별한다. ""를 폴더로 오인해
+        // 전체 삭제가 일어나는 일을 막는다.
+        if key.ends_with('/') {
+            let upper = prefix_upper_bound(key);
+            self.conn.execute(
+                "DELETE FROM items WHERE key >= ?1 AND key < ?2",
+                params![key, upper],
+            )?;
+            self.conn.execute(
+                "DELETE FROM folders WHERE prefix >= ?1 AND prefix < ?2",
+                params![key, upper],
+            )?;
+        } else {
+            self.conn
+                .execute("DELETE FROM items WHERE key = ?1", params![key])?;
+        }
+        Ok(())
+    }
+
+    /// 폴더의 complete 표시를 지워 다음 list_folder가 원격에서 다시 받게 한다.
+    /// folders 행이 없으면 어차피 미완료로 취급되므로 아무것도 하지 않는다.
+    pub fn invalidate_folder(&mut self, prefix: &str) -> Result<(), Error> {
+        let prefix = key::normalize_prefix(prefix);
+        self.conn.execute(
+            "UPDATE folders SET complete = 0 WHERE prefix = ?1",
+            params![prefix],
+        )?;
+        Ok(())
+    }
+
+    /// 재시도 가능한 작업을 기록하고 부여된 id를 반환한다.
+    pub fn add_pending_op(&mut self, kind: &str, payload: &str, now_ms: i64) -> Result<i64, Error> {
+        self.conn.execute(
+            "INSERT INTO pending_ops (kind, payload, created_at) VALUES (?1, ?2, ?3)",
+            params![kind, payload, now_ms],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// 기록된 작업의 payload를 교체한다(진행 상황 갱신용).
+    pub fn update_pending_op(&mut self, id: i64, payload: &str) -> Result<(), Error> {
+        self.conn.execute(
+            "UPDATE pending_ops SET payload = ?1 WHERE id = ?2",
+            params![payload, id],
+        )?;
+        Ok(())
+    }
+
+    /// 작업 기록을 지운다. 완료·포기 시 호출한다.
+    pub fn remove_pending_op(&mut self, id: i64) -> Result<(), Error> {
+        self.conn
+            .execute("DELETE FROM pending_ops WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    /// 등록 순서(id 오름차순)로 모든 대기 작업을 반환한다.
+    pub fn pending_ops(&self) -> Result<Vec<PendingOp>, Error> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, kind, payload, created_at FROM pending_ops ORDER BY id")?;
+        let ops = stmt
+            .query_map([], |row| {
+                Ok(PendingOp {
+                    id: row.get(0)?,
+                    kind: row.get(1)?,
+                    payload: row.get(2)?,
+                    created_at_ms: row.get(3)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(ops)
     }
 
     /// `PRAGMA user_version` 기반 마이그레이션. 0 → 1.
@@ -730,5 +852,212 @@ mod tests {
         // 없는 폴더는 None, 없는 키는 None.
         assert!(store.folder_state("missing/").unwrap().is_none());
         assert!(store.get_item("missing.txt").unwrap().is_none());
+    }
+
+    #[test]
+    fn upsert_item_appears_in_parent_cached_page() {
+        let mut store = MetadataStore::open_in_memory().unwrap();
+        store
+            .replace_folder("p/", &[Item::file("p/a.txt", 1, None, None)], 100)
+            .unwrap();
+
+        // 새 파일 upsert → 부모 폴더의 캐시 목록에 바로 나타난다.
+        store
+            .upsert_item(
+                &Item::file("p/b.txt", 2, Some("e".to_string()), Some(5)),
+                200,
+            )
+            .unwrap();
+        let keys: Vec<String> = store
+            .cached_page("p/", None, 100)
+            .unwrap()
+            .into_iter()
+            .map(|i| i.key)
+            .collect();
+        assert_eq!(keys, ["p/a.txt", "p/b.txt"]);
+
+        // 같은 키 재-upsert는 메타데이터를 덮어쓴다.
+        store
+            .upsert_item(&Item::file("p/b.txt", 9, None, None), 300)
+            .unwrap();
+        let item = store.get_item("p/b.txt").unwrap().unwrap();
+        assert_eq!(item.size, 9);
+        assert_eq!(item.etag, None);
+        assert_eq!(item.last_modified_ms, None);
+        // seen_at은 마지막 upsert 시각으로 갱신된다.
+        let seen_at: i64 = store
+            .conn
+            .query_row(
+                "SELECT seen_at FROM items WHERE key = 'p/b.txt'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(seen_at, 300);
+
+        // 폴더 항목도 부모 목록에 나타나고, 그 폴더 자체는 아직 미목록이다.
+        store.upsert_item(&Item::folder("p/new/"), 400).unwrap();
+        let keys: Vec<String> = store
+            .cached_page("p/", None, 100)
+            .unwrap()
+            .into_iter()
+            .map(|i| i.key)
+            .collect();
+        assert_eq!(keys, ["p/a.txt", "p/b.txt", "p/new/"]);
+        assert!(store.folder_state("p/new/").unwrap().is_none());
+
+        // 목록한 적 없는 부모 아래에도 upsert할 수 있다(다음 목록이 교체한다).
+        store
+            .upsert_item(&Item::file("q/x.txt", 1, None, None), 500)
+            .unwrap();
+        assert!(store.get_item("q/x.txt").unwrap().is_some());
+        assert!(store.folder_state("q/").unwrap().is_none());
+    }
+
+    #[test]
+    fn remove_item_deletes_file() {
+        let mut store = MetadataStore::open_in_memory().unwrap();
+        store
+            .replace_folder(
+                "p/",
+                &[
+                    Item::file("p/a.txt", 1, None, None),
+                    Item::file("p/b.txt", 2, None, None),
+                ],
+                100,
+            )
+            .unwrap();
+
+        store.remove_item("p/a.txt").unwrap();
+        assert!(store.get_item("p/a.txt").unwrap().is_none());
+        let keys: Vec<String> = store
+            .cached_page("p/", None, 100)
+            .unwrap()
+            .into_iter()
+            .map(|i| i.key)
+            .collect();
+        assert_eq!(keys, ["p/b.txt"]);
+        // 부모 폴더의 complete 상태는 유지된다.
+        assert!(store.folder_state("p/").unwrap().unwrap().complete);
+
+        // 없는 키를 지워도 오류가 아니다.
+        store.remove_item("p/none.txt").unwrap();
+        store.remove_item("").unwrap();
+    }
+
+    #[test]
+    fn remove_item_folder_clears_descendants() {
+        let mut store = MetadataStore::open_in_memory().unwrap();
+        store
+            .replace_folder(
+                "p/",
+                &[Item::file("p/a.txt", 1, None, None), Item::folder("p/sub/")],
+                100,
+            )
+            .unwrap();
+        store
+            .replace_folder(
+                "p/sub/",
+                &[
+                    Item::file("p/sub/x.txt", 1, None, None),
+                    Item::folder("p/sub/deep/"),
+                ],
+                100,
+            )
+            .unwrap();
+        store
+            .replace_folder(
+                "p/sub/deep/",
+                &[Item::file("p/sub/deep/y.txt", 1, None, None)],
+                100,
+            )
+            .unwrap();
+
+        store.remove_item("p/sub/").unwrap();
+
+        // 폴더 항목과 모든 하위 items·folders 행이 지워진다.
+        assert!(store.get_item("p/sub/").unwrap().is_none());
+        assert!(store.get_item("p/sub/x.txt").unwrap().is_none());
+        assert!(store.get_item("p/sub/deep/").unwrap().is_none());
+        assert!(store.get_item("p/sub/deep/y.txt").unwrap().is_none());
+        assert!(store.folder_state("p/sub/").unwrap().is_none());
+        assert!(store.folder_state("p/sub/deep/").unwrap().is_none());
+
+        // 부모 폴더와 다른 항목은 그대로다.
+        assert!(store.get_item("p/a.txt").unwrap().is_some());
+        let keys: Vec<String> = store
+            .cached_page("p/", None, 100)
+            .unwrap()
+            .into_iter()
+            .map(|i| i.key)
+            .collect();
+        assert_eq!(keys, ["p/a.txt"]);
+        assert!(store.folder_state("p/").unwrap().unwrap().complete);
+    }
+
+    #[test]
+    fn invalidate_folder_marks_incomplete() {
+        let mut store = MetadataStore::open_in_memory().unwrap();
+        store
+            .replace_folder("p/", &[Item::file("p/a.txt", 1, None, None)], 100)
+            .unwrap();
+        assert!(store.folder_state("p/").unwrap().unwrap().complete);
+
+        // 끝 '/' 없는 prefix도 같은 폴더를 가리킨다.
+        store.invalidate_folder("p").unwrap();
+        let state = store.folder_state("p/").unwrap().unwrap();
+        assert!(!state.complete);
+        // last_listed_at은 유지된다.
+        assert_eq!(state.last_listed_at_ms, Some(100));
+
+        // 없는 폴더를 무효화해도 행이 생기지 않는다(어차피 미완료 취급).
+        store.invalidate_folder("missing/").unwrap();
+        assert!(store.folder_state("missing/").unwrap().is_none());
+
+        // 다시 목록하면 complete로 돌아온다.
+        store
+            .replace_folder("p/", &[Item::file("p/a.txt", 1, None, None)], 200)
+            .unwrap();
+        assert!(store.folder_state("p/").unwrap().unwrap().complete);
+    }
+
+    #[test]
+    fn pending_ops_crud_and_order() {
+        let mut store = MetadataStore::open_in_memory().unwrap();
+        assert!(store.pending_ops().unwrap().is_empty());
+
+        let id1 = store
+            .add_pending_op("folder_rename", "{\"from\":\"a/\"}", 100)
+            .unwrap();
+        let id2 = store
+            .add_pending_op("folder_rename", "{\"from\":\"b/\"}", 200)
+            .unwrap();
+        assert!(id2 > id1);
+
+        // 등록 순서(id 오름차순)로 반환된다.
+        let ops = store.pending_ops().unwrap();
+        assert_eq!(ops.len(), 2);
+        assert_eq!(ops[0].id, id1);
+        assert_eq!(ops[0].kind, "folder_rename");
+        assert_eq!(ops[0].payload, "{\"from\":\"a/\"}");
+        assert_eq!(ops[0].created_at_ms, 100);
+        assert_eq!(ops[1].id, id2);
+        assert_eq!(ops[1].created_at_ms, 200);
+
+        // payload 갱신은 순서를 바꾸지 않는다.
+        store
+            .update_pending_op(id1, "{\"from\":\"a/\",\"done\":1}")
+            .unwrap();
+        let ops = store.pending_ops().unwrap();
+        assert_eq!(ops[0].id, id1);
+        assert_eq!(ops[0].payload, "{\"from\":\"a/\",\"done\":1}");
+
+        store.remove_pending_op(id1).unwrap();
+        let ops = store.pending_ops().unwrap();
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].id, id2);
+
+        store.remove_pending_op(id2).unwrap();
+        assert!(store.pending_ops().unwrap().is_empty());
     }
 }
