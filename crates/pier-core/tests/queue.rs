@@ -1,11 +1,16 @@
 //! 전송 대기열 테스트. 가짜 Backend로 큐 동작(동시성·FIFO·상태 전이·
-//! 스로틀)을 보고, PIER_TEST_MINIO=1일 때 MinIO로 실제 이어받기를 본다.
+//! 스로틀)을 보고, PIER_TEST_MINIO=1 또는 원격 대상(PIER_TEST_BUCKET 등)으로
+//! 실제 이어받기를 본다. 공용 설정·헬퍼는 tests/common/mod.rs를 본다.
+
+mod common;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+use common::{enabled, open_backend, runtime, TempDir};
 
 use pier_core::backend::{Backend, PutOptions};
 use pier_core::enumerate::Connection;
@@ -76,52 +81,6 @@ impl RecListener {
 impl QueueListener for RecListener {
     fn on_job_update(&self, job: JobSnapshot) {
         self.events.lock().unwrap().push(job);
-    }
-}
-
-/// 테스트마다 고유한 임시 디렉터리. Drop에서 지운다.
-struct TempDir(PathBuf);
-
-impl TempDir {
-    fn new(tag: &str) -> Self {
-        static N: AtomicUsize = AtomicUsize::new(0);
-        let path = std::env::temp_dir().join(format!(
-            "pier-queue-it-{}-{}-{tag}",
-            std::process::id(),
-            N.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::create_dir_all(&path).expect("임시 디렉터리 생성 실패");
-        Self(path)
-    }
-
-    fn join(&self, name: &str) -> PathBuf {
-        self.0.join(name)
-    }
-
-    /// `.name.pierdownload` 임시 파일 수(하위 포함).
-    fn temp_files(&self) -> Vec<PathBuf> {
-        let mut found = Vec::new();
-        let mut stack = vec![self.0.clone()];
-        while let Some(dir) = stack.pop() {
-            let Ok(rd) = std::fs::read_dir(&dir) else {
-                continue;
-            };
-            for entry in rd.flatten() {
-                let path = entry.path();
-                if path.is_dir() {
-                    stack.push(path);
-                } else if entry.file_name().to_string_lossy().contains("pierdownload") {
-                    found.push(path);
-                }
-            }
-        }
-        found
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 
@@ -604,55 +563,7 @@ fn small_upload_completes() {
     );
 }
 
-// ===== MinIO 통합 테스트 =====
-
-fn minio_enabled() -> bool {
-    std::env::var("PIER_TEST_MINIO").as_deref() == Ok("1")
-}
-
-fn minio_config() -> pier_core::config::ConnectionConfig {
-    pier_core::config::ConnectionConfig {
-        id: String::new(),
-        display_name: "pier-test".to_string(),
-        provider: pier_core::config::Provider::MinIO,
-        endpoint: Some("http://127.0.0.1:9000".to_string()),
-        region: "us-east-1".to_string(),
-        bucket: "pier-test".to_string(),
-        prefix: None,
-        path_style: true,
-        access_key_id: "minioadmin".to_string(),
-        chunk_size_mb: None,
-        concurrency: None,
-    }
-}
-
-/// 시드용 Operator(루트가 버킷 루트).
-fn minio_operator() -> opendal::Operator {
-    let builder = opendal::services::S3::default()
-        .bucket("pier-test")
-        .region("us-east-1")
-        .access_key_id("minioadmin")
-        .secret_access_key("minioadmin")
-        .disable_config_load()
-        .disable_ec2_metadata()
-        .root("/")
-        .endpoint("http://127.0.0.1:9000");
-    opendal::install_default();
-    opendal::Operator::new(builder).expect("테스트 Operator 생성 실패")
-}
-
-/// opendal 전역 HTTP 클라이언트 런타임과 묶이므로 공유 런타임을 쓴다
-/// (tests/transfer.rs와 같은 이유).
-fn runtime() -> &'static tokio::runtime::Runtime {
-    static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
-    RT.get_or_init(|| {
-        tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .expect("테스트 런타임 생성 실패")
-    })
-}
+// ===== 대상 엔드포인트 통합 테스트 =====
 
 const BIG_KEY: &str = "docs/p4-queue/big.bin";
 const BIG_SIZE: usize = 40 * 1024 * 1024;
@@ -661,9 +572,9 @@ fn big_data() -> Vec<u8> {
     (0..BIG_SIZE).map(|i| (i % 256) as u8).collect()
 }
 
-/// MinIO 백엔드의 Connection + 대기열을 만든다.
+/// 테스트 대상 백엔드의 Connection + 대기열을 만든다.
 fn minio_queue(dir: &TempDir, chunk_size: u64) -> TransferQueue<OpendalS3> {
-    let backend = OpendalS3::new(&minio_config(), "minioadmin").expect("백엔드 생성 실패");
+    let backend = open_backend();
     let store = MetadataStore::open(&dir.join("metadata.sqlite")).expect("메타데이터 열기 실패");
     let conn = Arc::new(Connection::with_backend(backend, store));
     let opts = TransferOptions {
@@ -678,12 +589,12 @@ fn minio_queue(dir: &TempDir, chunk_size: u64) -> TransferQueue<OpendalS3> {
 /// 40MB 다운로드 중 pause → 임시 파일 유지 → resume → 바이트 일치.
 #[test]
 fn download_pause_resume_minio() {
-    if !minio_enabled() {
+    if !enabled() {
         return;
     }
     let dir = TempDir::new("dl-pause");
     runtime().block_on(async {
-        let operator = minio_operator();
+        let operator = common::operator();
         let data = big_data();
         let ok = operator
             .stat(BIG_KEY)
@@ -740,12 +651,12 @@ fn download_pause_resume_minio() {
 /// 다운로드 중 cancel → Cancelled + 임시 파일 제거.
 #[test]
 fn download_cancel_removes_tmp_minio() {
-    if !minio_enabled() {
+    if !enabled() {
         return;
     }
     let dir = TempDir::new("dl-cancel");
     runtime().block_on(async {
-        let operator = minio_operator();
+        let operator = common::operator();
         let data = big_data();
         let ok = operator
             .stat(BIG_KEY)
@@ -784,13 +695,13 @@ fn download_cancel_removes_tmp_minio() {
 /// (pause 시점에 존재하던 완료 파일의 수정시각이 resume 후에도 같다.)
 #[test]
 fn folder_download_pause_resume_minio() {
-    if !minio_enabled() {
+    if !enabled() {
         return;
     }
     let dir = TempDir::new("folder-pause");
     let prefix = "docs/p4-queue-folder/";
     runtime().block_on(async {
-        let operator = minio_operator();
+        let operator = common::operator();
         // 파일 여덟 개(각 512KB — 빨리 끝나는 것과 늦게 끝나는 것이 섞이게).
         for i in 0..8 {
             let key = format!("{prefix}f{i}.bin");

@@ -1,123 +1,19 @@
-//! PIER_TEST_MINIO=1일 때만 실행되는 병렬 다운로드 통합 테스트.
-//! tests/minio_list.rs와 같은 패턴(공유 런타임, 임시 캐시 디렉터리)을 따른다.
+//! PIER_TEST_MINIO=1 또는 원격 대상(PIER_TEST_BUCKET 등)에서 실행되는
+//! 병렬 다운로드 통합 테스트. 공용 설정·헬퍼는 tests/common/mod.rs를 본다.
 
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Mutex, OnceLock};
+mod common;
 
-use opendal::services::S3;
+use std::sync::Mutex;
+
 use opendal::Operator;
-use pier_core::config::{ConnectionConfig, Provider};
 use pier_core::error::Error;
 use pier_core::transfer::{self, CancelToken, ProgressSink, TransferOptions};
-use pier_core::OpendalS3;
+
+use common::{enabled, local_minio, open_backend, runtime, TempDir};
 
 const KEY: &str = "docs/p2-transfer/big.bin";
 /// 약 40MB. 기본 청크(8MB)로 5개 청크가 된다.
 const SIZE: usize = 40 * 1024 * 1024;
-
-fn minio_enabled() -> bool {
-    std::env::var("PIER_TEST_MINIO").as_deref() == Ok("1")
-}
-
-fn minio_config() -> ConnectionConfig {
-    ConnectionConfig {
-        id: String::new(),
-        display_name: "pier-test".to_string(),
-        provider: Provider::MinIO,
-        endpoint: Some("http://127.0.0.1:9000".to_string()),
-        region: "us-east-1".to_string(),
-        bucket: "pier-test".to_string(),
-        prefix: None,
-        path_style: true,
-        access_key_id: "minioadmin".to_string(),
-        chunk_size_mb: None,
-        concurrency: None,
-    }
-}
-
-/// 시드용 Operator. 백엔드와 달리 루트가 버킷 루트다.
-fn minio_operator() -> Operator {
-    let builder = S3::default()
-        .bucket("pier-test")
-        .region("us-east-1")
-        .access_key_id("minioadmin")
-        .secret_access_key("minioadmin")
-        .disable_config_load()
-        .disable_ec2_metadata()
-        .root("/")
-        .endpoint("http://127.0.0.1:9000");
-    opendal::install_default();
-    Operator::new(builder).expect("테스트 Operator 생성 실패")
-}
-
-/// opendal의 전역 HTTP 클라이언트가 만든 런타임에 묶이므로 하나를 공유한다
-/// (minio_list.rs와 같은 이유).
-fn runtime() -> &'static tokio::runtime::Runtime {
-    static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
-    RT.get_or_init(|| {
-        tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .expect("테스트 런타임 생성 실패")
-    })
-}
-
-/// 테스트마다 고유한 임시 디렉터리. Drop에서 지운다.
-struct TempDir(PathBuf);
-
-impl TempDir {
-    fn new(tag: &str) -> Self {
-        static N: AtomicUsize = AtomicUsize::new(0);
-        let path = std::env::temp_dir().join(format!(
-            "pier-xfer-it-{}-{}-{tag}",
-            std::process::id(),
-            N.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::create_dir_all(&path).expect("임시 디렉터리 생성 실패");
-        Self(path)
-    }
-
-    fn dest(&self, name: &str) -> PathBuf {
-        self.0.join(name)
-    }
-
-    /// `.name.pierdownload` 임시 파일이 남아 있으면 true.
-    fn has_temp_file(&self) -> bool {
-        std::fs::read_dir(&self.0)
-            .map(|rd| {
-                rd.filter_map(|e| e.ok())
-                    .any(|e| e.file_name().to_string_lossy().contains("pierdownload"))
-            })
-            .unwrap_or(false)
-    }
-
-    /// 폴더 다운로드의 임시 파일은 하위 디렉터리에 생기므로 재귀로 검사한다.
-    fn has_temp_file_deep(&self) -> bool {
-        let mut stack = vec![self.0.clone()];
-        while let Some(dir) = stack.pop() {
-            let Ok(rd) = std::fs::read_dir(&dir) else {
-                continue;
-            };
-            for entry in rd.flatten() {
-                let path = entry.path();
-                if path.is_dir() {
-                    stack.push(path);
-                } else if entry.file_name().to_string_lossy().contains("pierdownload") {
-                    return true;
-                }
-            }
-        }
-        false
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
 
 /// 결정적 패턴의 big.bin 내용을 만든다.
 fn big_data() -> Vec<u8> {
@@ -140,10 +36,6 @@ async fn ensure_big_file(operator: &Operator) -> Vec<u8> {
             .expect("big.bin 업로드 실패");
     }
     data
-}
-
-fn open_backend() -> OpendalS3 {
-    OpendalS3::new(&minio_config(), "minioadmin").expect("백엔드 생성 실패")
 }
 
 /// 진행률 호출을 기록하는 싱크.
@@ -177,15 +69,15 @@ impl ProgressSink for CancelOnProgress {
 
 #[test]
 fn download_big_minio() {
-    if !minio_enabled() {
+    if !enabled() {
         return;
     }
     let dir = TempDir::new("big");
     runtime().block_on(async {
-        let operator = minio_operator();
+        let operator = common::operator();
         let data = ensure_big_file(&operator).await;
         let backend = open_backend();
-        let dest = dir.dest("big.bin");
+        let dest = dir.join("big.bin");
         let progress = RecProgress::default();
 
         let written = transfer::download(
@@ -213,15 +105,15 @@ fn download_big_minio() {
 
 #[test]
 fn download_cancel_minio() {
-    if !minio_enabled() {
+    if !enabled() {
         return;
     }
     let dir = TempDir::new("cancel");
     runtime().block_on(async {
-        let operator = minio_operator();
+        let operator = common::operator();
         ensure_big_file(&operator).await;
         let backend = open_backend();
-        let dest = dir.dest("cancel.bin");
+        let dest = dir.join("cancel.bin");
 
         // 1MB 청크·동시성 2 → 40청크. 첫 진행률에서 취소하면 나머지가 남는다.
         let opts = TransferOptions {
@@ -286,12 +178,12 @@ async fn ensure_folder_fixture(operator: &Operator) -> (Vec<u8>, Vec<u8>) {
 
 #[test]
 fn download_folder_minio() {
-    if !minio_enabled() {
+    if !enabled() {
         return;
     }
     let dir = TempDir::new("folder");
     runtime().block_on(async {
-        let operator = minio_operator();
+        let operator = common::operator();
         let (a, b) = ensure_folder_fixture(&operator).await;
         let backend = open_backend();
 
@@ -316,35 +208,37 @@ fn download_folder_minio() {
         assert!(!dir.has_temp_file_deep());
 
         // 폴더 마커만 있는 폴더(루트의 empty-folder/, seed-minio.sh가 생성)는
-        // 빈 디렉터리로 만들어진다.
-        let empty = transfer::download_folder(
-            &backend,
-            "empty-folder/",
-            &dir.0,
-            &TransferOptions::default(),
-            &RecProgress::default(),
-            &CancelToken::new(),
-        )
-        .await
-        .expect("빈 폴더 다운로드 실패");
-        assert_eq!(empty.local_path, dir.0.join("empty-folder"));
-        assert_eq!(empty.file_count, 0);
-        assert_eq!(empty.total_bytes, 0);
-        assert!(empty.local_path.is_dir());
-        assert_eq!(std::fs::read_dir(&empty.local_path).unwrap().count(), 0);
-        assert!(!dir.has_temp_file_deep());
+        // 빈 디렉터리로 만들어진다. 루트 시드 데이터라 로컬 MinIO에서만 본다.
+        if local_minio() {
+            let empty = transfer::download_folder(
+                &backend,
+                "empty-folder/",
+                &dir.0,
+                &TransferOptions::default(),
+                &RecProgress::default(),
+                &CancelToken::new(),
+            )
+            .await
+            .expect("빈 폴더 다운로드 실패");
+            assert_eq!(empty.local_path, dir.0.join("empty-folder"));
+            assert_eq!(empty.file_count, 0);
+            assert_eq!(empty.total_bytes, 0);
+            assert!(empty.local_path.is_dir());
+            assert_eq!(std::fs::read_dir(&empty.local_path).unwrap().count(), 0);
+            assert!(!dir.has_temp_file_deep());
+        }
     });
 }
 
 #[test]
 fn download_missing_key_minio() {
-    if !minio_enabled() {
+    if !enabled() {
         return;
     }
     let dir = TempDir::new("missing");
     runtime().block_on(async {
         let backend = open_backend();
-        let dest = dir.dest("missing.bin");
+        let dest = dir.join("missing.bin");
         let err = transfer::download(
             &backend,
             "docs/p2-transfer/no-such-key",

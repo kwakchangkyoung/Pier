@@ -4,3 +4,4 @@ apple/Frameworks/
 apple/*.xcodeproj/
 testdata/
 .DS_Store
+dist/

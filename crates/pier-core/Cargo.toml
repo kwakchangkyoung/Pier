@@ -3,6 +3,7 @@ name = "pier-core"
 version = "0.1.0"
 edition = "2021"
 publish = false
+license = "MIT OR Apache-2.0"
 
 [dependencies]
 # 0.4.35부터 default feature가 없으므로 set_boxed_logger 등을 위해 std를 켠다.

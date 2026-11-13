@@ -1,99 +1,22 @@
-//! PIER_TEST_MINIO=1일 때만 실행되는 업로드 통합 테스트.
-//! tests/transfer.rs와 같은 패턴(공유 런타임). 테스트마다 docs/p3-upload/
-//! 아래 고유한 하위 접두사를 써서 병렬 실행 시 서로의 객체를 지우지 않게 하고,
-//! 각 테스트 끝에서 자기 접두사만 정리한다.
+//! PIER_TEST_MINIO=1 또는 원격 대상(PIER_TEST_BUCKET 등)에서 실행되는
+//! 업로드 통합 테스트. 공용 설정·헬퍼는 tests/common/mod.rs를 본다.
+//! 테스트마다 docs/p3-upload/ 아래 고유한 하위 접두사를 써서 병렬 실행 시
+//! 서로의 객체를 지우지 않게 하고, 각 테스트 끝에서 자기 접두사만 정리한다
+//! (원격에서는 PIER_TEST_PREFIX 아래에 놓인다).
+
+mod common;
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::OnceLock;
 
-use opendal::services::S3;
-use opendal::Operator;
-use pier_core::config::{ConnectionConfig, Provider};
 use pier_core::error::Error;
 use pier_core::transfer::{self, CancelToken, ProgressSink, TransferOptions, UploadMode};
 use pier_core::{Backend, OpendalS3};
 
+use common::{big_enabled, cleanup_prefix, enabled, open_backend, runtime, TempDir};
+
 /// 모든 테스트 객체는 docs/p3-upload/<테스트명>/ 아래에 만든다.
 const P3: &str = "docs/p3-upload/";
-
-fn minio_enabled() -> bool {
-    std::env::var("PIER_TEST_MINIO").as_deref() == Ok("1")
-}
-
-fn big_enabled() -> bool {
-    std::env::var("PIER_TEST_BIG").as_deref() == Ok("1")
-}
-
-fn minio_config() -> ConnectionConfig {
-    ConnectionConfig {
-        id: String::new(),
-        display_name: "pier-test".to_string(),
-        provider: Provider::MinIO,
-        endpoint: Some("http://127.0.0.1:9000".to_string()),
-        region: "us-east-1".to_string(),
-        bucket: "pier-test".to_string(),
-        prefix: None,
-        path_style: true,
-        access_key_id: "minioadmin".to_string(),
-        chunk_size_mb: None,
-        concurrency: None,
-    }
-}
-
-/// 시드·검증용 Operator. 백엔드와 달리 루트가 버킷 루트다.
-fn minio_operator() -> Operator {
-    let builder = S3::default()
-        .bucket("pier-test")
-        .region("us-east-1")
-        .access_key_id("minioadmin")
-        .secret_access_key("minioadmin")
-        .disable_config_load()
-        .disable_ec2_metadata()
-        .root("/")
-        .endpoint("http://127.0.0.1:9000");
-    opendal::install_default();
-    Operator::new(builder).expect("테스트 Operator 생성 실패")
-}
-
-/// opendal의 전역 HTTP 클라이언트가 만든 런타임에 묶이므로 하나를 공유한다
-/// (tests/transfer.rs와 같은 이유).
-fn runtime() -> &'static tokio::runtime::Runtime {
-    static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
-    RT.get_or_init(|| {
-        tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .expect("테스트 런타임 생성 실패")
-    })
-}
-
-/// 테스트마다 고유한 임시 디렉터리. Drop에서 지운다.
-struct TempDir(PathBuf);
-
-impl TempDir {
-    fn new(tag: &str) -> Self {
-        static N: AtomicUsize = AtomicUsize::new(0);
-        let path = std::env::temp_dir().join(format!(
-            "pier-up-it-{}-{}-{tag}",
-            std::process::id(),
-            N.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::create_dir_all(&path).expect("임시 디렉터리 생성 실패");
-        Self(path)
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
-fn open_backend() -> OpendalS3 {
-    OpendalS3::new(&minio_config(), "minioadmin").expect("백엔드 생성 실패")
-}
 
 /// 진행률 호출을 기록하지 않는 싱크.
 struct RecProgress;
@@ -114,19 +37,6 @@ impl ProgressSink for CancelAfter {
         if self.calls.fetch_add(1, Ordering::SeqCst) + 1 >= self.after {
             self.token.cancel();
         }
-    }
-}
-
-/// prefix 아래 객체를 전부 지운다(테스트 정리용).
-async fn cleanup_prefix(operator: &Operator, prefix: &str) {
-    let entries = operator
-        .list_with(prefix)
-        .recursive(true)
-        .await
-        .expect("정리 목록 실패");
-    let paths: Vec<String> = entries.iter().map(|e| e.path().to_string()).collect();
-    if !paths.is_empty() {
-        operator.delete_iter(paths).await.expect("정리 삭제 실패");
     }
 }
 
@@ -159,13 +69,13 @@ async fn assert_remote_bytes(backend: &OpendalS3, key: &str, expected: &[u8]) {
 
 #[test]
 fn upload_small_file_minio() {
-    if !minio_enabled() {
+    if !enabled() {
         return;
     }
     let prefix = format!("{P3}small/");
     let dir = TempDir::new("small");
     runtime().block_on(async {
-        let operator = minio_operator();
+        let operator = common::operator();
         cleanup_prefix(&operator, &prefix).await;
         let backend = open_backend();
         let key = format!("{prefix}small.bin");
@@ -205,13 +115,13 @@ fn upload_small_file_minio() {
 
 #[test]
 fn upload_multipart_40mb_minio() {
-    if !minio_enabled() {
+    if !enabled() {
         return;
     }
     let prefix = format!("{P3}mpu/");
     let dir = TempDir::new("mpu");
     runtime().block_on(async {
-        let operator = minio_operator();
+        let operator = common::operator();
         cleanup_prefix(&operator, &prefix).await;
         let backend = open_backend();
         let key = format!("{prefix}mpu-40mb.bin");
@@ -239,13 +149,13 @@ fn upload_multipart_40mb_minio() {
 
 #[test]
 fn upload_cancel_minio() {
-    if !minio_enabled() {
+    if !enabled() {
         return;
     }
     let prefix = format!("{P3}cancel/");
     let dir = TempDir::new("cancel");
     runtime().block_on(async {
-        let operator = minio_operator();
+        let operator = common::operator();
         cleanup_prefix(&operator, &prefix).await;
         let backend = open_backend();
         let key = format!("{prefix}cancel.bin");
@@ -288,13 +198,13 @@ fn upload_cancel_minio() {
 
 #[test]
 fn upload_conflict_modes_minio() {
-    if !minio_enabled() {
+    if !enabled() {
         return;
     }
     let prefix = format!("{P3}conflict/");
     let dir = TempDir::new("conflict");
     runtime().block_on(async {
-        let operator = minio_operator();
+        let operator = common::operator();
         cleanup_prefix(&operator, &prefix).await;
         let backend = open_backend();
         let key = format!("{prefix}conflict.txt");
@@ -392,13 +302,13 @@ fn upload_conflict_modes_minio() {
 
 #[test]
 fn upload_folder_minio() {
-    if !minio_enabled() {
+    if !enabled() {
         return;
     }
     let prefix = format!("{P3}folder/");
     let dir = TempDir::new("folder");
     runtime().block_on(async {
-        let operator = minio_operator();
+        let operator = common::operator();
         cleanup_prefix(&operator, &prefix).await;
         let backend = open_backend();
 
@@ -464,12 +374,12 @@ fn upload_folder_minio() {
 
 #[test]
 fn create_dir_and_list_minio() {
-    if !minio_enabled() {
+    if !enabled() {
         return;
     }
     let prefix = format!("{P3}mkdir/");
     runtime().block_on(async {
-        let operator = minio_operator();
+        let operator = common::operator();
         cleanup_prefix(&operator, &prefix).await;
         let backend = open_backend();
 
@@ -516,12 +426,12 @@ fn create_dir_and_list_minio() {
 
 #[test]
 fn delete_keys_batches_minio() {
-    if !minio_enabled() {
+    if !enabled() {
         return;
     }
     let prefix = format!("{P3}bulk/");
     runtime().block_on(async {
-        let operator = minio_operator();
+        let operator = common::operator();
         cleanup_prefix(&operator, &prefix).await;
         let backend = open_backend();
 
@@ -553,13 +463,13 @@ fn delete_keys_batches_minio() {
 /// 서버 측 복사해 크기가 같은지 확인한다.
 #[test]
 fn upload_big_51gb_minio() {
-    if !minio_enabled() || !big_enabled() {
+    if !enabled() || !big_enabled() {
         return;
     }
     let prefix = format!("{P3}big51/");
     let dir = TempDir::new("big51");
     runtime().block_on(async {
-        let operator = minio_operator();
+        let operator = common::operator();
         cleanup_prefix(&operator, &prefix).await;
         let backend = open_backend();
 

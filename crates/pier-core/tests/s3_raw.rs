@@ -1,15 +1,15 @@
-//! PIER_TEST_MINIO=1일 때만 실행되는 서명 S3 호출·이어올리기 통합 테스트.
-//! tests/transfer.rs와 같은 패턴(공유 런타임, 임시 디렉터리)을 따른다.
-//! 테스트 객체는 docs/p4-raw/ 아래에 두고 끝에 지운다.
+//! PIER_TEST_MINIO=1 또는 원격 대상(PIER_TEST_BUCKET 등)에서 실행되는
+//! 서명 S3 호출·이어올리기 통합 테스트.
+//! 공용 설정·헬퍼는 tests/common/mod.rs를 본다.
+//! 테스트 객체는 docs/p4-raw/ 아래에 두고 끝에 지운다
+//! (원격에서는 PIER_TEST_PREFIX 아래에 놓인다).
 
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+mod common;
 
-use opendal::services::S3;
-use opendal::Operator;
+use std::path::Path;
+use std::sync::{Arc, Mutex};
+
 use pier_core::backend::WriteCondition;
-use pier_core::config::{ConnectionConfig, Provider};
 use pier_core::error::Error;
 use pier_core::metadata::MetadataStore;
 use pier_core::s3_raw::{abort_upload, upload_resumable, ResumableUpload, S3Raw};
@@ -18,90 +18,12 @@ use reqsign_aws_v4::{Credential, RequestSigner};
 use reqsign_core::hash::hex_sha256;
 use reqsign_core::{Context, SignRequest};
 
+use common::{enabled, open_raw, runtime, target, TempDir};
+
 /// 테스트 객체 루트.
 const PREFIX: &str = "docs/p4-raw/";
 /// 40MB. chunk 10MB로 파트 4개다.
 const SIZE: usize = 40 * 1024 * 1024;
-
-fn minio_enabled() -> bool {
-    std::env::var("PIER_TEST_MINIO").as_deref() == Ok("1")
-}
-
-fn minio_config() -> ConnectionConfig {
-    ConnectionConfig {
-        id: String::new(),
-        display_name: "pier-test".to_string(),
-        provider: Provider::MinIO,
-        endpoint: Some("http://127.0.0.1:9000".to_string()),
-        region: "us-east-1".to_string(),
-        bucket: "pier-test".to_string(),
-        prefix: None,
-        path_style: true,
-        access_key_id: "minioadmin".to_string(),
-        chunk_size_mb: None,
-        concurrency: None,
-    }
-}
-
-fn open_raw(secret: &str) -> S3Raw {
-    S3Raw::new(&minio_config(), secret).expect("S3Raw 생성 실패")
-}
-
-/// 검증·비교용 Operator. 루트가 버킷 루트다.
-fn minio_operator() -> Operator {
-    let builder = S3::default()
-        .bucket("pier-test")
-        .region("us-east-1")
-        .access_key_id("minioadmin")
-        .secret_access_key("minioadmin")
-        .disable_config_load()
-        .disable_ec2_metadata()
-        .root("/")
-        .endpoint("http://127.0.0.1:9000");
-    opendal::install_default();
-    Operator::new(builder).expect("테스트 Operator 생성 실패")
-}
-
-fn runtime() -> &'static tokio::runtime::Runtime {
-    static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
-    RT.get_or_init(|| {
-        tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .expect("테스트 런타임 생성 실패")
-    })
-}
-
-/// 테스트마다 고유한 임시 디렉터리. Drop에서 지운다.
-struct TempDir(PathBuf);
-
-impl TempDir {
-    fn new(tag: &str) -> Self {
-        static N: AtomicUsize = AtomicUsize::new(0);
-        let path = std::env::temp_dir().join(format!(
-            "pier-s3raw-it-{}-{}-{tag}",
-            std::process::id(),
-            N.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::create_dir_all(&path).expect("임시 디렉터리 생성 실패");
-        Self(path)
-    }
-
-    /// 패턴이 있는(size 만큼의) 테스트 파일을 만든다.
-    fn write_file(&self, name: &str, size: usize) -> PathBuf {
-        let path = self.0.join(name);
-        let data: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
-        std::fs::write(&path, &data).expect("테스트 파일 쓰기 실패");
-        path
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
 
 /// 진행률을 기록하고, 임계치에 도달하면 토큰을 취소하는 싱크.
 struct RecSink {
@@ -147,9 +69,7 @@ impl ProgressSink for RecSink {
 /// 버킷의 미완료 멀티파트 업로드 (키, 업로드 ID) 목록.
 /// 검증용 ListMultipartUploads 직접 호출 — 코어와 같은 reqwest+reqsign 경로.
 async fn list_mpu() -> Vec<(String, String)> {
-    let url: reqwest::Url = "http://127.0.0.1:9000/pier-test?uploads"
-        .parse()
-        .expect("URL");
+    let url: reqwest::Url = common::list_uploads_url().parse().expect("URL");
     let mut req = reqwest::Request::new(http::Method::GET, url);
     req.headers_mut().insert(
         http::header::HeaderName::from_static("x-amz-content-sha256"),
@@ -158,10 +78,11 @@ async fn list_mpu() -> Vec<(String, String)> {
     *req.body_mut() = Some(reqwest::Body::from(Vec::new()));
     let http_req: http::Request<reqwest::Body> = req.try_into().expect("요청 변환");
     let (mut parts, body) = http_req.into_parts();
-    let signer = RequestSigner::new("s3", "us-east-1");
+    let t = target();
+    let signer = RequestSigner::new("s3", &t.region);
     let cred = Credential {
-        access_key_id: "minioadmin".to_string(),
-        secret_access_key: "minioadmin".to_string(),
+        access_key_id: t.access_key.clone(),
+        secret_access_key: t.secret.clone(),
         session_token: None,
         expires_in: None,
     };
@@ -236,6 +157,7 @@ async fn pause_mid_upload(
     raw: &S3Raw,
     src: &Path,
     key: &str,
+    condition: WriteCondition,
     cancel_at: u64,
 ) -> (Option<ResumableUpload>, Vec<u64>) {
     let token = CancelToken::new();
@@ -245,18 +167,9 @@ async fn pause_mid_upload(
         chunk_size: 10 * 1024 * 1024,
         ..Default::default()
     };
-    let err = upload_resumable(
-        raw,
-        src,
-        key,
-        WriteCondition::Any,
-        &opts,
-        &mut state,
-        &sink,
-        &token,
-    )
-    .await
-    .expect_err("취소된 업로드는 Err를 반환해야 한다");
+    let err = upload_resumable(raw, src, key, condition, &opts, &mut state, &sink, &token)
+        .await
+        .expect_err("취소된 업로드는 Err를 반환해야 한다");
     assert!(
         matches!(err, Error::Cancelled(_)),
         "기대: Cancelled, 실제: {err}"
@@ -266,12 +179,12 @@ async fn pause_mid_upload(
 
 #[test]
 fn head_storage_class_standard() {
-    if !minio_enabled() {
+    if !enabled() {
         return;
     }
     let dir = TempDir::new("head");
     runtime().block_on(async {
-        let raw = open_raw("minioadmin");
+        let raw = open_raw();
         let key = format!("{PREFIX}head.bin");
         let src = dir.write_file("head.bin", 6 * 1024 * 1024);
         let mut state = None;
@@ -291,7 +204,7 @@ fn head_storage_class_standard() {
         let class = raw.head_storage_class(&key).await.expect("head 실패");
         assert_eq!(class, "STANDARD");
 
-        minio_operator()
+        common::operator()
             .delete(&key)
             .await
             .expect("테스트 객체 정리 실패");
@@ -300,12 +213,12 @@ fn head_storage_class_standard() {
 
 #[test]
 fn resumable_upload_pause_and_resume() {
-    if !minio_enabled() {
+    if !enabled() {
         return;
     }
     let dir = TempDir::new("resume");
     runtime().block_on(async {
-        let raw = open_raw("minioadmin");
+        let raw = open_raw();
         let key = format!("{PREFIX}resume.bin");
         let src = dir.write_file("resume.bin", SIZE);
         let expected = std::fs::read(&src).expect("원본 읽기");
@@ -315,7 +228,8 @@ fn resumable_upload_pause_and_resume() {
         };
 
         // 40MB, 파트 4개. 진행률이 20MB(50%)를 넘는 순간 취소한다.
-        let (state, calls) = pause_mid_upload(&raw, &src, &key, SIZE as u64 / 2).await;
+        let (state, calls) =
+            pause_mid_upload(&raw, &src, &key, WriteCondition::Any, SIZE as u64 / 2).await;
         let paused = state.expect("일시정지 후 상태가 남아야 한다");
         assert!(!paused.parts.is_empty(), "완료된 파트가 상태에 있어야 한다");
         assert!(paused.parts.len() < 4, "전부 올라가면 안 된다");
@@ -358,14 +272,14 @@ fn resumable_upload_pause_and_resume() {
         assert_eq!(calls2.last().copied(), Some(SIZE as u64));
 
         // 바이트 일치 확인.
-        let got = minio_operator()
+        let got = common::operator()
             .read(&key)
             .await
             .expect("다운로드 실패")
             .to_vec();
         assert_eq!(got, expected, "재개 완료 객체가 원본과 달라야 하지 않는다");
 
-        minio_operator()
+        common::operator()
             .delete(&key)
             .await
             .expect("테스트 객체 정리 실패");
@@ -374,25 +288,32 @@ fn resumable_upload_pause_and_resume() {
 
 #[test]
 fn abort_after_pause_leaves_no_mpu() {
-    if !minio_enabled() {
+    if !enabled() {
         return;
     }
     let dir = TempDir::new("abort");
     runtime().block_on(async {
-        let raw = open_raw("minioadmin");
+        let raw = open_raw();
         let key = format!("{PREFIX}abort.bin");
         let src = dir.write_file("abort.bin", SIZE);
 
-        let (state, _) = pause_mid_upload(&raw, &src, &key, SIZE as u64 / 2).await;
+        let (state, _) =
+            pause_mid_upload(&raw, &src, &key, WriteCondition::Any, SIZE as u64 / 2).await;
         let paused = state.expect("상태가 남아야 한다");
         assert!(
-            list_mpu().await.iter().any(|(k, _)| *k == key),
+            list_mpu()
+                .await
+                .iter()
+                .any(|(k, _)| *k == common::bucket_key(&key)),
             "abort 전에는 MPU가 있어야 한다"
         );
 
         abort_upload(&raw, &paused).await.expect("abort 실패");
         assert!(
-            !list_mpu().await.iter().any(|(k, _)| *k == key),
+            !list_mpu()
+                .await
+                .iter()
+                .any(|(k, _)| *k == common::bucket_key(&key)),
             "abort 후에는 미완료 MPU가 없어야 한다"
         );
     });
@@ -400,12 +321,12 @@ fn abort_after_pause_leaves_no_mpu() {
 
 #[test]
 fn complete_conditional_conflict() {
-    if !minio_enabled() {
+    if !enabled() {
         return;
     }
     let dir = TempDir::new("conflict");
     runtime().block_on(async {
-        let raw = open_raw("minioadmin");
+        let raw = open_raw();
         let key = format!("{PREFIX}conflict.bin");
         let src = dir.write_file("conflict.bin", 6 * 1024 * 1024);
         let opts = TransferOptions::default();
@@ -449,7 +370,7 @@ fn complete_conditional_conflict() {
             abort_upload(&raw, &s).await.expect("테스트 MPU 정리 실패");
         }
 
-        minio_operator()
+        common::operator()
             .delete(&key)
             .await
             .expect("테스트 객체 정리 실패");
@@ -458,12 +379,12 @@ fn complete_conditional_conflict() {
 
 #[test]
 fn cleanup_pending_uploads_removes_leftover() {
-    if !minio_enabled() {
+    if !enabled() {
         return;
     }
     let dir = TempDir::new("cleanup");
     runtime().block_on(async {
-        let mut raw = open_raw("minioadmin");
+        let mut raw = open_raw();
         let store = Arc::new(Mutex::new(
             MetadataStore::open_in_memory().expect("저장소 생성 실패"),
         ));
@@ -471,7 +392,8 @@ fn cleanup_pending_uploads_removes_leftover() {
 
         let key = format!("{PREFIX}cleanup.bin");
         let src = dir.write_file("cleanup.bin", SIZE);
-        let (state, _) = pause_mid_upload(&raw, &src, &key, SIZE as u64 / 2).await;
+        let (state, _) =
+            pause_mid_upload(&raw, &src, &key, WriteCondition::Any, SIZE as u64 / 2).await;
         assert!(state.is_some());
         assert_eq!(
             store
@@ -485,7 +407,7 @@ fn cleanup_pending_uploads_removes_leftover() {
         );
 
         // 다음 실행 때 정리하듯 새 S3Raw로 정리한다.
-        let cleaned = open_raw("minioadmin")
+        let cleaned = open_raw()
             .cleanup_pending_uploads(&store)
             .await
             .expect("정리 실패");
@@ -500,7 +422,10 @@ fn cleanup_pending_uploads_removes_leftover() {
             "정리 후 기록이 비어야 한다"
         );
         assert!(
-            !list_mpu().await.iter().any(|(k, _)| *k == key),
+            !list_mpu()
+                .await
+                .iter()
+                .any(|(k, _)| *k == common::bucket_key(&key)),
             "정리 후에는 미완료 MPU가 없어야 한다"
         );
     });
@@ -508,11 +433,11 @@ fn cleanup_pending_uploads_removes_leftover() {
 
 #[test]
 fn wrong_secret_is_authentication() {
-    if !minio_enabled() {
+    if !enabled() {
         return;
     }
     runtime().block_on(async {
-        let raw = open_raw("wrong-secret");
+        let raw = S3Raw::new(&common::config(), "wrong-secret").expect("S3Raw 생성 실패");
         let err = raw
             .head_storage_class(&format!("{PREFIX}head.bin"))
             .await
@@ -526,12 +451,12 @@ fn wrong_secret_is_authentication() {
 
 #[test]
 fn korean_space_plus_key_upload() {
-    if !minio_enabled() {
+    if !enabled() {
         return;
     }
     let dir = TempDir::new("utf8");
     runtime().block_on(async {
-        let raw = open_raw("minioadmin");
+        let raw = open_raw();
         let key = format!("{PREFIX}한글 파일 +.bin");
         let src = dir.write_file("utf8.bin", 6 * 1024 * 1024);
         let expected = std::fs::read(&src).expect("원본 읽기");
@@ -550,16 +475,98 @@ fn korean_space_plus_key_upload() {
         .await
         .expect("한글·공백 키 업로드 실패");
 
-        let got = minio_operator()
+        let got = common::operator()
             .read(&key)
             .await
             .expect("다운로드 실패")
             .to_vec();
         assert_eq!(got, expected);
 
-        minio_operator()
+        common::operator()
             .delete(&key)
             .await
             .expect("테스트 객체 정리 실패");
+    });
+}
+
+/// IfMatch로 올리는 도중 다른 클라이언트가 덮어쓰면 재개 시
+/// Complete 직전 HEAD 비교가 Conflict를 낸다 — 조건부 헤더를 무시하는
+/// 백엔드에서도 데이터 유실이 없음을 검증한다(SPEC 3.4).
+#[test]
+fn resume_conflict_after_remote_change_minio() {
+    if !enabled() {
+        return;
+    }
+    let dir = TempDir::new("race");
+    runtime().block_on(async {
+        let operator = common::operator();
+        let raw = open_raw();
+        let key = format!("{PREFIX}race.bin");
+        let src = dir.write_file("race.bin", SIZE);
+        let opts = TransferOptions {
+            chunk_size: 10 * 1024 * 1024,
+            ..Default::default()
+        };
+
+        // 기존 객체를 만들고 현재 ETag를 가져온다.
+        // HEAD 응답의 ETag는 인용부호를 포함해 오므로 형태를 맞춘다.
+        operator
+            .write(&key, b"original".to_vec())
+            .await
+            .expect("시드 쓰기 실패");
+        let remote_etag = operator
+            .stat(&key)
+            .await
+            .expect("stat 실패")
+            .etag()
+            .expect("ETag 없음")
+            .to_string();
+        let etag = if remote_etag.starts_with('"') {
+            remote_etag
+        } else {
+            format!("\"{remote_etag}\"")
+        };
+
+        // IfMatch(etag)로 업로드를 시작해 중간에 멈춘다.
+        let (state, _) = pause_mid_upload(
+            &raw,
+            &src,
+            &key,
+            WriteCondition::IfMatch(etag.clone()),
+            SIZE as u64 / 2,
+        )
+        .await;
+        let paused = state.expect("일시정지 후 상태가 남아야 한다");
+
+        // 다른 클라이언트가 같은 키를 덮어쓴다.
+        operator
+            .write(&key, b"changed-by-other".to_vec())
+            .await
+            .expect("덮어쓰기 실패");
+
+        // 재개: Complete 직전 HEAD 비교에서 Conflict가 나야 한다.
+        let mut resume_state = Some(paused);
+        let err = upload_resumable(
+            &raw,
+            &src,
+            &key,
+            WriteCondition::IfMatch(etag),
+            &opts,
+            &mut resume_state,
+            &RecSink::new(),
+            &CancelToken::new(),
+        )
+        .await
+        .expect_err("원격 변경 후 재개는 Conflict여야 한다");
+        assert!(
+            matches!(err, Error::Conflict(_)),
+            "기대: Conflict, 실제: {err}"
+        );
+
+        // 남은 MPU와 시드 객체를 정리한다.
+        if let Some(s) = resume_state {
+            abort_upload(&raw, &s).await.expect("MPU 정리 실패");
+        }
+        operator.delete(&key).await.expect("테스트 객체 정리 실패");
     });
 }

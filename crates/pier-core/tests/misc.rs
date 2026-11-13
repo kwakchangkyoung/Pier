@@ -1,117 +1,46 @@
-//! PIER_TEST_MINIO=1일 때 MinIO로 실행되는 Phase 4 편의 기능 통합 테스트
-//! (presigned URL, 프리페치, 미리보기 캐시).
-//! 프리셋·presign 만료 검증·로그 싱크 설치는 MinIO 없이도 실행한다.
-//! 다른 통합 테스트 파일들과 같은 패턴(공유 런타임, 임시 캐시 디렉터리)을 따른다.
+//! PIER_TEST_MINIO=1 또는 원격 대상(PIER_TEST_BUCKET 등)에서 실행되는
+//! Phase 4 편의 기능 통합 테스트 (presigned URL, 프리페치, 미리보기 캐시).
+//! 프리셋·presign 만료 검증·로그 싱크 설치는 대상 없이도 실행한다.
+//! 공용 설정·헬퍼는 tests/common/mod.rs를 본다.
+
+mod common;
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use opendal::services::S3;
-use opendal::Operator;
-use pier_core::config::{preset_endpoint, presets, ConnectionConfig, Provider};
-use pier_core::enumerate::Connection;
+use pier_core::config::{preset_endpoint, presets, Provider};
 use pier_core::error::Error;
 use pier_core::logging::{self, LogSink};
 use pier_core::preview::preview_file;
-use pier_core::transfer::{CancelToken, ProgressSink};
-use pier_core::{Backend, OpendalS3};
+use pier_core::transfer::CancelToken;
+use pier_core::Backend;
+
+use common::{enabled, open_backend, open_conn, runtime, secret, target, Nop, TempDir};
 
 /// 테스트 객체는 모두 이 접두사 아래에 두고 끝에 지운다.
+/// (원격에서는 PIER_TEST_PREFIX 아래에 놓인다.)
 const ROOT: &str = "docs/p4-misc";
-const SECRET: &str = "minioadmin";
 
-fn minio_enabled() -> bool {
-    std::env::var("PIER_TEST_MINIO").as_deref() == Ok("1")
-}
-
-fn minio_config() -> ConnectionConfig {
-    ConnectionConfig {
-        id: String::new(),
-        display_name: "pier-test".to_string(),
-        provider: Provider::MinIO,
-        endpoint: Some("http://127.0.0.1:9000".to_string()),
-        region: "us-east-1".to_string(),
-        bucket: "pier-test".to_string(),
-        prefix: None,
-        path_style: true,
-        access_key_id: "minioadmin".to_string(),
-        chunk_size_mb: None,
-        concurrency: None,
+/// presigned URL을 GET해 응답 원문을 반환한다.
+/// http는 reqwest 없이 검증하려는 최소 TCP 클라이언트를 쓰고,
+/// https는 reqwest로 받는다.
+async fn http_get(url: &str) -> String {
+    if url.starts_with("https://") {
+        let resp = reqwest::get(url).await.expect("presigned GET 실패");
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return format!("HTTP {status}\n\n{body}");
     }
-}
-
-/// 시드·정리용 Operator. 백엔드와 달리 루트가 버킷 루트다.
-fn minio_operator() -> Operator {
-    let builder = S3::default()
-        .bucket("pier-test")
-        .region("us-east-1")
-        .access_key_id("minioadmin")
-        .secret_access_key("minioadmin")
-        .disable_config_load()
-        .disable_ec2_metadata()
-        .root("/")
-        .endpoint("http://127.0.0.1:9000");
-    opendal::install_default();
-    Operator::new(builder).expect("테스트 Operator 생성 실패")
-}
-
-/// opendal의 전역 HTTP 클라이언트가 만든 런타임에 묶이므로 하나를 공유한다
-/// (minio_list.rs와 같은 이유).
-fn runtime() -> &'static tokio::runtime::Runtime {
-    static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
-    RT.get_or_init(|| {
-        tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .expect("테스트 런타임 생성 실패")
-    })
-}
-
-/// 테스트마다 고유한 임시 디렉터리. Drop에서 지운다.
-struct TempDir(PathBuf);
-
-impl TempDir {
-    fn new(tag: &str) -> Self {
-        static N: AtomicUsize = AtomicUsize::new(0);
-        let path = std::env::temp_dir().join(format!(
-            "pier-misc-it-{}-{}-{tag}",
-            std::process::id(),
-            N.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::create_dir_all(&path).expect("임시 디렉터리 생성 실패");
-        Self(path)
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
-/// 아무것도 하지 않는 진행률 싱크.
-struct Nop;
-
-impl ProgressSink for Nop {
-    fn on_progress(&self, _transferred: u64, _total: u64) {}
-}
-
-/// http:// URL을 std TcpStream으로 GET해 응답 원문을 반환한다.
-/// reqwest 없이 presigned URL을 검증하기 위한 최소 HTTP 클라이언트다.
-fn http_get(url: &str) -> String {
     let rest = url
         .strip_prefix("http://")
-        .expect("이 테스트는 http URL만 다룬다");
+        .expect("이 테스트는 http/https URL만 다룬다");
     let (authority, path_query) = match rest.split_once('/') {
         Some((a, p)) => (a.to_string(), format!("/{p}")),
         None => (rest.to_string(), "/".to_string()),
     };
-    let mut stream = TcpStream::connect(&authority).expect("MinIO 연결 실패");
+    let mut stream = TcpStream::connect(&authority).expect("엔드포인트 연결 실패");
     let request =
         format!("GET {path_query} HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n\r\n");
     stream
@@ -161,7 +90,7 @@ fn presets_and_endpoints() {
 #[test]
 fn presign_expiry_bounds() {
     // 서명 생성은 네트워크를 타지 않으므로 오프라인에서도 검증할 수 있다.
-    let backend = OpendalS3::new(&minio_config(), SECRET).expect("백엔드 생성 실패");
+    let backend = open_backend();
     let rt = runtime();
     // 1초 미만·7일 초과는 원격 호출 전에 거절한다.
     assert!(rt
@@ -174,7 +103,13 @@ fn presign_expiry_bounds() {
     let url = rt
         .block_on(backend.presign_read("a.txt", Duration::from_secs(3600)))
         .expect("presign 실패");
-    assert!(url.starts_with("http://127.0.0.1:9000/pier-test/"));
+    // 원격 대상이면 엔드포인트가 다르므로 버킷·키 포함만 본다.
+    if target().remote {
+        assert!(url.contains(&target().bucket), "{url}");
+        assert!(url.contains("a.txt"), "{url}");
+    } else {
+        assert!(url.starts_with("http://127.0.0.1:9000/pier-test/"));
+    }
     assert!(url.contains("X-Amz-Signature="));
 }
 
@@ -193,10 +128,10 @@ fn log_sink_install_and_capture() {
     // 전역 로거는 한 번만 설치할 수 있다.
     assert!(logging::install(Box::new(Capture(Arc::clone(&captured)))).is_err());
 
-    if minio_enabled() {
+    if enabled() {
         runtime().block_on(async {
             let cache = TempDir::new("log");
-            let conn = Connection::open(&minio_config(), SECRET, &cache.0).expect("연결 생성 실패");
+            let conn = open_conn(&cache.0);
             conn.list_folder(&format!("{ROOT}/"), None)
                 .await
                 .expect("목록 실패");
@@ -211,7 +146,7 @@ fn log_sink_install_and_capture() {
         // Info 이상만 전달된다.
         assert!(*level <= log::Level::Info, "{level}: {message}");
         // 시크릿·서명·객체 키는 로그에 남기지 않는다(SPEC 4.6).
-        assert!(!message.contains(SECRET), "{message}");
+        assert!(!message.contains(secret()), "{message}");
         assert!(!message.contains("X-Amz-Signature"), "{message}");
         assert!(!message.contains(ROOT), "{message}");
     }
@@ -221,23 +156,23 @@ fn log_sink_install_and_capture() {
 
 #[test]
 fn presigned_url_get_minio() {
-    if !minio_enabled() {
+    if !enabled() {
         return;
     }
     runtime().block_on(async {
-        let operator = minio_operator();
+        let operator = common::operator();
         let key = format!("{ROOT}/presign/hello.txt");
         operator
             .write(&key, "presigned hello")
             .await
             .expect("시드 쓰기 실패");
 
-        let backend = OpendalS3::new(&minio_config(), SECRET).expect("백엔드 생성 실패");
+        let backend = open_backend();
         let url = backend
             .presign_read(&key, Duration::from_secs(300))
             .await
             .expect("presign 실패");
-        let response = http_get(&url);
+        let response = http_get(&url).await;
         let status = response.lines().next().unwrap_or_default().to_string();
         assert!(status.contains("200"), "상태: {status}");
         assert!(
@@ -254,13 +189,13 @@ fn presigned_url_get_minio() {
 
 #[test]
 fn prefetch_minio() {
-    if !minio_enabled() {
+    if !enabled() {
         return;
     }
     runtime().block_on(async {
-        let operator = minio_operator();
+        let operator = common::operator();
         let cache = TempDir::new("prefetch");
-        let conn = Connection::open(&minio_config(), SECRET, &cache.0).expect("연결 생성 실패");
+        let conn = open_conn(&cache.0);
         let paths = vec![
             format!("{ROOT}/pf/sub1/a.txt"),
             format!("{ROOT}/pf/sub2/b.txt"),
@@ -324,13 +259,13 @@ fn prefetch_minio() {
 
 #[test]
 fn preview_minio() {
-    if !minio_enabled() {
+    if !enabled() {
         return;
     }
     runtime().block_on(async {
-        let operator = minio_operator();
+        let operator = common::operator();
         let cache = TempDir::new("preview");
-        let conn = Connection::open(&minio_config(), SECRET, &cache.0).expect("연결 생성 실패");
+        let conn = open_conn(&cache.0);
         let key = format!("{ROOT}/preview/미리보기 파일.txt");
         operator
             .write(&key, "미리보기 내용")

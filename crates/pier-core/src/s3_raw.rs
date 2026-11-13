@@ -135,6 +135,45 @@ impl S3Raw {
         Ok(class.to_string())
     }
 
+    /// HEAD로 대상 객체의 ETag를 읽는다. 객체가 없으면 Error::NotFound.
+    async fn head_etag(&self, key: &str) -> Result<Option<String>, Error> {
+        let resp = self
+            .send("head", key, Method::HEAD, &[], HeaderMap::new(), Vec::new())
+            .await?;
+        Ok(resp
+            .headers()
+            .get(http::header::ETAG)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string))
+    }
+
+    /// 조건부 쓰기 사전 확인. OpenDAL이 조건부 쓰기 capability를 모든
+    /// S3 계열 서비스에 true로 보고하듯이, If-Match/If-None-Match를 조용히
+    /// 무시하는 백엔드는 응답만으로 걸러낼 수 없다. 헤더만 믿고 쓰면 다른
+    /// 클라이언트의 변경을 덮어쓰므로(SPEC 3.4 데이터 유실 금지) 업로드
+    /// 직전에 항상 HEAD로 조건을 확인한다. HEAD~쓰기 사이의 경쟁은
+    /// Complete 요청에 붙는 조건부 헤더가 막는다(지원하는 백엔드에서).
+    async fn check_write_condition(
+        &self,
+        key: &str,
+        condition: &WriteCondition,
+    ) -> Result<(), Error> {
+        match condition {
+            WriteCondition::Any => Ok(()),
+            WriteCondition::NotExists => match self.head_etag(key).await {
+                Ok(_) => Err(Error::Conflict(format!("{key}가 이미 존재한다"))),
+                Err(Error::NotFound(_)) => Ok(()),
+                Err(e) => Err(e),
+            },
+            WriteCondition::IfMatch(etag) => match self.head_etag(key).await {
+                Ok(Some(remote)) if remote == *etag => Ok(()),
+                Ok(_) => Err(Error::Conflict(format!("{key}의 ETag가 다르다"))),
+                Err(Error::NotFound(_)) => Err(Error::Conflict(format!("{key}가 없다"))),
+                Err(e) => Err(e),
+            },
+        }
+    }
+
     /// metadata `pending_uploads`에 남아 있는 멀티파트 업로드를 모두
     /// abort하고 기록을 지운다. 정리한 건수를 반환한다.
     /// 서버에 이미 없는 업로드(NoSuchUpload)는 성공으로 본다.
@@ -485,8 +524,10 @@ pub async fn upload_resumable(
         *state = None;
     }
 
-    // 새 업로드 시작.
+    // 새 업로드 시작. 조건부 헤더를 무시하는 백엔드에서도 다른
+    // 클라이언트의 변경을 덮어쓰지 않게 Create 직전에 HEAD로 본다.
     if state.is_none() {
+        raw.check_write_condition(key, &condition).await?;
         let upload_id = raw.create_multipart(key).await?;
         let s = ResumableUpload {
             upload_id: upload_id.clone(),
@@ -573,6 +614,9 @@ pub async fn upload_resumable(
             server_parts.len()
         )));
     }
+    // 업로드 도중(재개 포함) 원격 객체가 바뀌었을 수 있으므로 Complete
+    // 직전에도 같은 확인을 한 번 더 한다.
+    raw.check_write_condition(key, &condition).await?;
     raw.complete_multipart(key, &upload_id, &server_parts, &condition)
         .await?;
     raw.drop_pending(&upload_id)?;

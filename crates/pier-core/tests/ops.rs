@@ -1,103 +1,25 @@
-//! PIER_TEST_MINIO=1일 때만 실행되는 객체 작업 통합 테스트.
-//! tests/upload.rs와 같은 패턴(공유 런타임·Operator 시드·TempDir).
+//! PIER_TEST_MINIO=1 또는 원격 대상(PIER_TEST_BUCKET 등)에서 실행되는
+//! 객체 작업 통합 테스트. 공용 설정·헬퍼는 tests/common/mod.rs를 본다.
 //! 테스트마다 docs/p3-ops/ 아래 고유한 하위 접두사를 써서 병렬 실행 시
-//! 서로의 객체를 지우지 않게 하고, 각 테스트 끝에서 자기 접두사만 정리한다.
+//! 서로의 객체를 지우지 않게 하고, 각 테스트 끝에서 자기 접두사만 정리한다
+//! (원격에서는 PIER_TEST_PREFIX 아래에 놓인다).
 
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::OnceLock;
+mod common;
 
-use opendal::services::S3;
-use opendal::Operator;
-use pier_core::config::{ConnectionConfig, Provider};
 use pier_core::enumerate::Connection;
 use pier_core::error::Error;
 use pier_core::transfer::{CancelToken, ProgressSink, TransferOptions, UploadMode};
-use pier_core::{Backend, OpendalS3};
+use pier_core::Backend;
+
+use common::{
+    big_enabled, cleanup_prefix, enabled, open_backend, open_conn, runtime, seed_files, TempDir,
+};
 
 /// 모든 테스트 객체는 docs/p3-ops/<테스트명>/ 아래에 만든다.
 const P3: &str = "docs/p3-ops/";
 
-fn minio_enabled() -> bool {
-    std::env::var("PIER_TEST_MINIO").as_deref() == Ok("1")
-}
-
-fn big_enabled() -> bool {
-    std::env::var("PIER_TEST_BIG").as_deref() == Ok("1")
-}
-
-fn minio_config() -> ConnectionConfig {
-    ConnectionConfig {
-        id: String::new(),
-        display_name: "pier-test".to_string(),
-        provider: Provider::MinIO,
-        endpoint: Some("http://127.0.0.1:9000".to_string()),
-        region: "us-east-1".to_string(),
-        bucket: "pier-test".to_string(),
-        prefix: None,
-        path_style: true,
-        access_key_id: "minioadmin".to_string(),
-        chunk_size_mb: None,
-        concurrency: None,
-    }
-}
-
-/// 시드·검증용 Operator. 백엔드와 달리 루트가 버킷 루트다.
-fn minio_operator() -> Operator {
-    let builder = S3::default()
-        .bucket("pier-test")
-        .region("us-east-1")
-        .access_key_id("minioadmin")
-        .secret_access_key("minioadmin")
-        .disable_config_load()
-        .disable_ec2_metadata()
-        .root("/")
-        .endpoint("http://127.0.0.1:9000");
-    opendal::install_default();
-    Operator::new(builder).expect("테스트 Operator 생성 실패")
-}
-
-/// opendal의 전역 HTTP 클라이언트가 만든 런타임에 묶이므로 하나를 공유한다
-/// (tests/upload.rs와 같은 이유).
-fn runtime() -> &'static tokio::runtime::Runtime {
-    static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
-    RT.get_or_init(|| {
-        tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .expect("테스트 런타임 생성 실패")
-    })
-}
-
-/// 테스트마다 고유한 임시 디렉터리. Drop에서 지운다.
-struct TempDir(PathBuf);
-
-impl TempDir {
-    fn new(tag: &str) -> Self {
-        static N: AtomicUsize = AtomicUsize::new(0);
-        let path = std::env::temp_dir().join(format!(
-            "pier-ops-it-{}-{}-{tag}",
-            std::process::id(),
-            N.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::create_dir_all(&path).expect("임시 디렉터리 생성 실패");
-        Self(path)
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
 fn open_connection(cache: &TempDir) -> Connection {
-    Connection::open(&minio_config(), "minioadmin", &cache.0).expect("연결 생성 실패")
-}
-
-fn open_backend() -> OpendalS3 {
-    OpendalS3::new(&minio_config(), "minioadmin").expect("백엔드 생성 실패")
+    open_conn(&cache.0)
 }
 
 /// 진행률 호출을 기록하지 않는 싱크.
@@ -107,42 +29,14 @@ impl ProgressSink for RecProgress {
     fn on_progress(&self, _transferred: u64, _total: u64) {}
 }
 
-/// prefix 아래 객체를 전부 지운다(테스트 정리용).
-async fn cleanup_prefix(operator: &Operator, prefix: &str) {
-    let entries = operator
-        .list_with(prefix)
-        .recursive(true)
-        .await
-        .expect("정리 목록 실패");
-    let paths: Vec<String> = entries.iter().map(|e| e.path().to_string()).collect();
-    if !paths.is_empty() {
-        operator.delete_iter(paths).await.expect("정리 삭제 실패");
-    }
-}
-
-/// prefix/ 아래 count개 파일을 빠르게 시드한다.
-async fn seed_files(operator: &Operator, prefix: &str, count: usize) {
-    for chunk in (0..count).collect::<Vec<_>>().chunks(100) {
-        let mut set = tokio::task::JoinSet::new();
-        for i in chunk {
-            let op = operator.clone();
-            let key = format!("{prefix}f{i:04}.txt");
-            set.spawn(async move {
-                op.write(&key, b"x".to_vec()).await.expect("시드 쓰기 실패");
-            });
-        }
-        while set.join_next().await.is_some() {}
-    }
-}
-
 #[test]
 fn create_folder_list_existing_conflict_minio() {
-    if !minio_enabled() {
+    if !enabled() {
         return;
     }
     let prefix = format!("{P3}mkdir/");
     runtime().block_on(async {
-        let operator = minio_operator();
+        let operator = common::operator();
         cleanup_prefix(&operator, &prefix).await;
         let cache = TempDir::new("mkdir-cache");
         let conn = open_connection(&cache);
@@ -184,12 +78,12 @@ fn create_folder_list_existing_conflict_minio() {
 
 #[test]
 fn rename_file_move_minio() {
-    if !minio_enabled() {
+    if !enabled() {
         return;
     }
     let prefix = format!("{P3}mvfile/");
     runtime().block_on(async {
-        let operator = minio_operator();
+        let operator = common::operator();
         cleanup_prefix(&operator, &prefix).await;
         let cache = TempDir::new("mvfile-cache");
         let conn = open_connection(&cache);
@@ -228,12 +122,12 @@ fn rename_file_move_minio() {
 
 #[test]
 fn rename_file_conflict_minio() {
-    if !minio_enabled() {
+    if !enabled() {
         return;
     }
     let prefix = format!("{P3}mvconf/");
     runtime().block_on(async {
-        let operator = minio_operator();
+        let operator = common::operator();
         cleanup_prefix(&operator, &prefix).await;
         let cache = TempDir::new("mvconf-cache");
         let conn = open_connection(&cache);
@@ -264,12 +158,12 @@ fn rename_file_conflict_minio() {
 
 #[test]
 fn rename_folder_30_minio() {
-    if !minio_enabled() {
+    if !enabled() {
         return;
     }
     let prefix = format!("{P3}r30/");
     runtime().block_on(async {
-        let operator = minio_operator();
+        let operator = common::operator();
         cleanup_prefix(&operator, &prefix).await;
         let cache = TempDir::new("r30-cache");
         let conn = open_connection(&cache);
@@ -316,12 +210,12 @@ fn rename_folder_30_minio() {
 
 #[test]
 fn rename_folder_over_limit_minio() {
-    if !minio_enabled() {
+    if !enabled() {
         return;
     }
     let prefix = format!("{P3}r1001/");
     runtime().block_on(async {
-        let operator = minio_operator();
+        let operator = common::operator();
         cleanup_prefix(&operator, &prefix).await;
         let cache = TempDir::new("r1001-cache");
         let conn = open_connection(&cache);
@@ -358,12 +252,12 @@ fn rename_folder_over_limit_minio() {
 
 #[test]
 fn delete_folder_minio() {
-    if !minio_enabled() {
+    if !enabled() {
         return;
     }
     let prefix = format!("{P3}del/");
     runtime().block_on(async {
-        let operator = minio_operator();
+        let operator = common::operator();
         cleanup_prefix(&operator, &prefix).await;
         let cache = TempDir::new("del-cache");
         let conn = open_connection(&cache);
@@ -399,13 +293,13 @@ fn delete_folder_minio() {
 
 #[test]
 fn test_connection_minio() {
-    if !minio_enabled() {
+    if !enabled() {
         return;
     }
     runtime().block_on(async {
         let cache = TempDir::new("tc-cache");
         let conn = open_connection(&cache);
-        // 목록 + 쓰기 권한 확인. minioadmin은 쓰기가 되므로 true.
+        // 목록 + 쓰기 권한 확인. 대상 자격증명은 쓰기가 된다고 가정한다.
         let can_write = conn.test_connection().await.expect("연결 실패");
         assert!(can_write, "can_write가 false다");
     });
@@ -415,13 +309,13 @@ fn test_connection_minio() {
 /// 이름 변경·이동하고 원본이 지워지는지 확인한다.
 #[test]
 fn rename_big_file_minio() {
-    if !minio_enabled() || !big_enabled() {
+    if !enabled() || !big_enabled() {
         return;
     }
     let prefix = format!("{P3}big/");
     let dir = TempDir::new("big-src");
     runtime().block_on(async {
-        let operator = minio_operator();
+        let operator = common::operator();
         cleanup_prefix(&operator, &prefix).await;
         let cache = TempDir::new("big-cache");
         let conn = open_connection(&cache);
@@ -471,5 +365,19 @@ fn rename_big_file_minio() {
         assert_eq!(st.size, size, "대상 크기 불일치");
 
         cleanup_prefix(&operator, &prefix).await;
+    });
+}
+
+/// compat-test.sh가 끝에 호출하는 정리 도우미.
+/// 원격 대상에서만 연결 루트(PIER_TEST_PREFIX) 아래를 통째로 지운다.
+/// 로컬 MinIO에서는 버킷 시드 데이터를 지키기 위해 항상 건너뛴다.
+#[test]
+fn remote_prefix_cleanup() {
+    if !common::target().remote {
+        return;
+    }
+    runtime().block_on(async {
+        let operator = common::operator();
+        cleanup_prefix(&operator, "").await;
     });
 }

@@ -1,93 +1,19 @@
-use std::collections::HashSet;
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::OnceLock;
+//! PIER_TEST_MINIO=1 또는 원격 대상(PIER_TEST_BUCKET 등)에서 실행되는
+//! 목록·캐시 통합 테스트. 루트 시드 데이터(seed-minio.sh)에 의존하는
+//! 테스트는 로컬 MinIO에서만 실행한다(local_minio()).
+//! 공용 설정·헬퍼는 tests/common/mod.rs를 본다.
 
-use opendal::services::S3;
+mod common;
+
+use std::collections::HashSet;
+
 use opendal::Operator;
-use pier_core::config::{ConnectionConfig, Provider};
 use pier_core::enumerate::Connection;
 use pier_core::error::Error;
-use pier_core::transfer::{CancelToken, ProgressSink, TransferOptions};
+use pier_core::transfer::{CancelToken, TransferOptions};
 use pier_core::Item;
 
-/// 진행률을 무시하는 테스트용 싱크.
-struct NoopProgress;
-
-impl ProgressSink for NoopProgress {
-    fn on_progress(&self, _transferred: u64, _total: u64) {}
-}
-
-fn minio_enabled() -> bool {
-    std::env::var("PIER_TEST_MINIO").as_deref() == Ok("1")
-}
-
-fn minio_config() -> ConnectionConfig {
-    ConnectionConfig {
-        id: String::new(),
-        display_name: "pier-test".to_string(),
-        provider: Provider::MinIO,
-        endpoint: Some("http://127.0.0.1:9000".to_string()),
-        region: "us-east-1".to_string(),
-        bucket: "pier-test".to_string(),
-        prefix: None,
-        path_style: true,
-        access_key_id: "minioadmin".to_string(),
-        chunk_size_mb: None,
-        concurrency: None,
-    }
-}
-
-/// 시드용 Operator. 백엔드와 달리 루트가 버킷 루트다.
-fn minio_operator() -> Operator {
-    let builder = S3::default()
-        .bucket("pier-test")
-        .region("us-east-1")
-        .access_key_id("minioadmin")
-        .secret_access_key("minioadmin")
-        .disable_config_load()
-        .disable_ec2_metadata()
-        .root("/")
-        .endpoint("http://127.0.0.1:9000");
-    opendal::install_default();
-    Operator::new(builder).expect("테스트 Operator 생성 실패")
-}
-
-/// 모든 MinIO 테스트가 공유하는 단일 런타임.
-/// #[tokio::test]는 테스트마다 별도 런타임을 만들고, opendal의 전역 HTTP
-/// 클라이언트는 연결 태스크를 만든 런타임에 묶인다. 런타임이 먼저
-/// 종료되면 "dispatch task is gone" 오류가 나므로 하나를 공유한다.
-fn runtime() -> &'static tokio::runtime::Runtime {
-    static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
-    RT.get_or_init(|| {
-        tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .expect("테스트 런타임 생성 실패")
-    })
-}
-
-/// 테스트마다 고유한 임시 캐시 디렉터리. Drop에서 지운다.
-struct TempDir(PathBuf);
-
-impl TempDir {
-    fn new(tag: &str) -> Self {
-        static N: AtomicUsize = AtomicUsize::new(0);
-        let path = std::env::temp_dir().join(format!(
-            "pier-it-{}-{}-{tag}",
-            std::process::id(),
-            N.fetch_add(1, Ordering::Relaxed)
-        ));
-        Self(path)
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
+use common::{config, enabled, local_minio, open_conn, runtime, Nop, TempDir};
 
 /// 시드는 프로세스당 한 번만 실행한다.
 static SEED: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
@@ -143,10 +69,6 @@ async fn seed(operator: &Operator) -> Result<(), opendal::Error> {
     Ok(())
 }
 
-fn open_conn(cache_dir: &Path) -> Connection {
-    Connection::open(&minio_config(), "minioadmin", cache_dir).expect("연결 생성 실패")
-}
-
 /// prefix 아래 모든 페이지를 순회해 (페이지 크기 목록, 전체 키, 캐시 여부)를 모은다.
 async fn collect_all(conn: &Connection, prefix: &str) -> (Vec<usize>, Vec<String>, Vec<bool>) {
     let mut page_sizes = Vec::new();
@@ -172,7 +94,7 @@ async fn collect_all(conn: &Connection, prefix: &str) -> (Vec<usize>, Vec<String
 
 #[test]
 fn root_first_page_minio() {
-    if !minio_enabled() {
+    if !local_minio() {
         return;
     }
     let _cache = TempDir::new("root");
@@ -210,12 +132,12 @@ fn root_first_page_minio() {
 
 #[test]
 fn paging_minio() {
-    if !minio_enabled() {
+    if !enabled() {
         return;
     }
     let _cache = TempDir::new("paging");
     runtime().block_on(async {
-        let operator = minio_operator();
+        let operator = common::operator();
         ensure_seeded(&operator).await;
         let conn = open_conn(&_cache.0);
 
@@ -278,12 +200,12 @@ fn paging_minio() {
 
 #[test]
 fn bugcheck_regression_minio() {
-    if !minio_enabled() {
+    if !enabled() {
         return;
     }
     let _cache = TempDir::new("bugcheck");
     runtime().block_on(async {
-        let operator = minio_operator();
+        let operator = common::operator();
         ensure_seeded(&operator).await;
         let conn = open_conn(&_cache.0);
 
@@ -321,7 +243,7 @@ fn bugcheck_regression_minio() {
 
 #[test]
 fn marker_only_folder_lists_empty_minio() {
-    if !minio_enabled() {
+    if !local_minio() {
         return;
     }
     let _cache = TempDir::new("marker");
@@ -340,7 +262,7 @@ fn marker_only_folder_lists_empty_minio() {
 
 #[test]
 fn stat_and_read_minio() {
-    if !minio_enabled() {
+    if !local_minio() {
         return;
     }
     let _cache = TempDir::new("statread");
@@ -376,7 +298,7 @@ fn stat_and_read_minio() {
                 "한글 파일.txt",
                 &dest,
                 &TransferOptions::default(),
-                &NoopProgress,
+                &Nop,
                 &CancelToken::new(),
             )
             .await
@@ -394,7 +316,7 @@ fn stat_and_read_minio() {
                 "없는키",
                 &missing_dest,
                 &TransferOptions::default(),
-                &NoopProgress,
+                &Nop,
                 &CancelToken::new(),
             )
             .await
@@ -412,12 +334,12 @@ fn stat_and_read_minio() {
 
 #[test]
 fn refresh_detects_add_and_delete_minio() {
-    if !minio_enabled() {
+    if !enabled() {
         return;
     }
     let _cache = TempDir::new("refresh");
     runtime().block_on(async {
-        let operator = minio_operator();
+        let operator = common::operator();
         ensure_seeded(&operator).await;
         // 이전 실패 실행의 잔여물을 지워 멱등하게 만든다.
         let _ = operator.delete("docs/p2-refresh/a.txt").await;
@@ -486,7 +408,7 @@ fn refresh_detects_add_and_delete_minio() {
 
 #[test]
 fn test_connection_minio() {
-    if !minio_enabled() {
+    if !enabled() {
         return;
     }
     let _cache = TempDir::new("testconn");
@@ -499,8 +421,8 @@ fn test_connection_minio() {
             .expect("test_connection이 실패했다");
 
         // 잘못된 시크릿 → Authentication 에러가 전파된다.
-        let bad = Connection::open(&minio_config(), "wrong-secret", &_bad_cache.0)
-            .expect("연결 생성 실패");
+        let bad =
+            Connection::open(&config(), "wrong-secret", &_bad_cache.0).expect("연결 생성 실패");
         let err = bad
             .test_connection()
             .await

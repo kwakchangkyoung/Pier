@@ -52,13 +52,38 @@ impl OpendalS3 {
     }
 
     /// WriteCondition을 OpenDAL WriteOptions로 변환한다.
-    /// 백엔드가 조건부 쓰기를 지원하지 않으면(capability) 쓰기 직전
-    /// stat으로 조건을 확인하는 폴백을 둔다(SPEC 3.4).
+    /// 조건부 쓰기면 capability와 무관하게 쓰기 직전 stat(HEAD)으로 조건을
+    /// 확인한다 — OpenDAL은 조건부 쓰기 capability를 모든 S3 계열 서비스에
+    /// true로 보고해, 헤더를 조용히 무시하는 백엔드를 걸러낼 수 없다.
+    /// 헤더만 믿으면 다른 클라이언트의 변경을 덮어쓰므로 SPEC 3.4(데이터
+    /// 유실 금지)를 어긴다. 조건부 헤더도 함께 보내 지원하는 백엔드에서는
+    /// stat~쓰기 사이의 경쟁까지 서버가 막게 한다.
     async fn condition_options(
         &self,
         key: &str,
         condition: &WriteCondition,
     ) -> Result<WriteOptions, Error> {
+        match condition {
+            WriteCondition::Any => {}
+            WriteCondition::NotExists => match self.operator.stat(key).await {
+                Ok(_) => {
+                    return Err(Error::Conflict(format!("{key}가 이미 존재한다")));
+                }
+                Err(e) if e.kind() == opendal::ErrorKind::NotFound => {}
+                Err(e) => return Err(Error::from_opendal(e, "stat", key)),
+            },
+            WriteCondition::IfMatch(etag) => match self.operator.stat(key).await {
+                Ok(meta) => {
+                    if meta.etag() != Some(etag.as_str()) {
+                        return Err(Error::Conflict(format!("{key}의 ETag가 다르다")));
+                    }
+                }
+                Err(e) if e.kind() == opendal::ErrorKind::NotFound => {
+                    return Err(Error::Conflict(format!("{key}가 없다")));
+                }
+                Err(e) => return Err(Error::from_opendal(e, "stat", key)),
+            },
+        }
         let cap = self.operator.info().capability();
         let mut opts = WriteOptions::default();
         match condition {
@@ -66,31 +91,11 @@ impl OpendalS3 {
             WriteCondition::NotExists => {
                 if cap.write_with_if_not_exists {
                     opts.if_not_exists = true;
-                } else {
-                    match self.operator.stat(key).await {
-                        Ok(_) => {
-                            return Err(Error::Conflict(format!("{key}가 이미 존재한다")));
-                        }
-                        Err(e) if e.kind() == opendal::ErrorKind::NotFound => {}
-                        Err(e) => return Err(Error::from_opendal(e, "stat", key)),
-                    }
                 }
             }
             WriteCondition::IfMatch(etag) => {
                 if cap.write_with_if_match {
                     opts.if_match = Some(etag.clone());
-                } else {
-                    match self.operator.stat(key).await {
-                        Ok(meta) => {
-                            if meta.etag() != Some(etag.as_str()) {
-                                return Err(Error::Conflict(format!("{key}의 ETag가 다르다")));
-                            }
-                        }
-                        Err(e) if e.kind() == opendal::ErrorKind::NotFound => {
-                            return Err(Error::Conflict(format!("{key}가 없다")));
-                        }
-                        Err(e) => return Err(Error::from_opendal(e, "stat", key)),
-                    }
                 }
             }
         }

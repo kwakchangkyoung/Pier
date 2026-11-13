@@ -16,8 +16,8 @@ pub enum WriteCondition {
     /// 대상이 없어야 한다(If-None-Match: *). 이미 있으면 Error::Conflict.
     NotExists,
     /// 대상 ETag가 이 값과 같아야 한다(If-Match). 다르거나 없으면
-    /// Error::Conflict. 백엔드가 조건부 쓰기를 지원하지 않으면
-    /// 쓰기 직전 stat으로 ETag를 비교한다.
+    /// Error::Conflict. 조건부 헤더 지원 여부와 무관하게 쓰기 직전
+    /// stat으로 ETag를 항상 비교한다.
     IfMatch(String),
 }
 
