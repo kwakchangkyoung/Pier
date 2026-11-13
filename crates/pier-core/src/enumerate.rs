@@ -1,9 +1,12 @@
-//! 폴더 목록 조회와 SQLite 캐시 기반 페이지네이션 (SPEC 4.2, 4.3).
+//! 폴더 목록 조회와 SQLite 캐시 기반 페이지네이션 (SPEC 4.2, 4.3, 3.5).
 //!
 //! 원격에서는 폴더 바로 아래 목록을 한 번에 받아 캐시에 저장하고,
 //! FFI/CLI에는 캐시에서 키 순으로 PAGE_SIZE개씩 나눈 페이지를 돌려준다.
 //! S3 응답 경계를 넘는 부분 읽기는 OpenDAL 목록 순서 때문에 항목이
 //! 누락될 수 있어 쓰지 않는다.
+//!
+//! 캐시가 complete면 list_folder는 캐시로 즉시 응답하고, 백그라운드
+//! 갱신은 refresh가 원격 목록을 다시 받아 캐시를 한 트랜잭션으로 교체한다.
 
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
@@ -15,7 +18,9 @@ use crate::config::ConnectionConfig;
 use crate::error::Error;
 use crate::item::Item;
 use crate::key;
+pub use crate::metadata::Changes;
 use crate::metadata::MetadataStore;
+use crate::transfer::{CancelToken, FolderDownload, ProgressSink, TransferOptions};
 
 /// 캐시에서 한 페이지에 담는 최대 항목 수(SPEC 4.3).
 pub const PAGE_SIZE: usize = 1000;
@@ -69,7 +74,8 @@ impl<B: Backend> Connection<B> {
     /// 잘라 응답한다(`from_cache=false`). 커서가 주어졌는데 캐시가 complete가
     /// 아니면 원격 목록부터 다시 받는다.
     ///
-    /// Phase 1은 캐시가 있으면 갱신하지 않는다(백그라운드 갱신은 Phase 2).
+    /// complete 캐시를 그대로 쓰므로 백그라운드 갱신은 호출자가
+    /// `refresh`로 따로 실행한다(SPEC 3.5).
     pub async fn list_folder(
         &self,
         prefix: &str,
@@ -87,12 +93,10 @@ impl<B: Backend> Connection<B> {
         };
 
         if !complete {
-            // 원격 전체 목록 → 캐시 저장. 잠금은 네트워크 호출 동안 놓는다.
+            // 원격 전체 목록 → 캐시 교체. 잠금은 네트워크 호출 동안 놓는다.
             let items = self.backend.list_folder(&prefix).await?;
-            let listing_started_at_ms = now_ms();
             let mut store = self.lock()?;
-            store.store_page(&prefix, &items, listing_started_at_ms)?;
-            store.finish_listing(&prefix, listing_started_at_ms)?;
+            store.replace_folder(&prefix, &items, now_ms())?;
         }
 
         // 페이지는 캐시에서 로컬로 나눈다. 다음 페이지 존재 여부를 알기 위해
@@ -114,6 +118,24 @@ impl<B: Backend> Connection<B> {
         })
     }
 
+    /// 폴더를 원격에서 다시 읽어 캐시를 교체하고 변경 사항을 반환한다.
+    ///
+    /// 잠금은 네트워크 호출 동안 잡지 않으므로 갱신이 진행되는 동안에도
+    /// list_folder는 이전 캐시로 즉시 응답한다(SPEC 3.5). 캐시 교체는
+    /// `replace_folder`의 한 트랜잭션이라 중간 상태가 보이지 않는다.
+    pub async fn refresh(&self, prefix: &str) -> Result<Changes, Error> {
+        let prefix = key::normalize_prefix(prefix);
+        let items = self.backend.list_folder(&prefix).await?;
+        let mut store = self.lock()?;
+        store.replace_folder(&prefix, &items, now_ms())
+    }
+
+    /// 원격 루트 목록을 한 번 조회해 연결·인증·버킷 접근 가능 여부만
+    /// 확인한다. 캐시에는 아무것도 쓰지 않고, 에러는 그대로 전파한다.
+    pub async fn test_connection(&self) -> Result<(), Error> {
+        self.backend.list_folder("").await.map(|_| ())
+    }
+
     /// 단일 아이템 메타데이터. 캐시에 있으면 캐시, 없으면 원격.
     pub async fn stat(&self, key: &str) -> Result<Item, Error> {
         {
@@ -125,16 +147,43 @@ impl<B: Backend> Connection<B> {
         self.backend.stat(key).await
     }
 
-    /// 객체를 dest 파일로 다운로드하고 쓴 바이트 수를 반환한다.
-    pub async fn download(&self, key: &str, dest: &Path) -> Result<u64, Error> {
-        self.backend.read_to_file(key, dest).await
-    }
-
     /// 뮤텍스 잠금. 포이즌(잠금 보유 중 패닉)이면 다른 오류로 변환한다.
     fn lock(&self) -> Result<MutexGuard<'_, MetadataStore>, Error> {
         self.store
             .lock()
             .map_err(|_| Error::Other("메타데이터 캐시 잠금이 깨졌다".to_string()))
+    }
+}
+
+impl<B> Connection<B>
+where
+    B: Backend + Clone + Send + Sync + 'static,
+{
+    /// 객체를 dest 파일로 다운로드하고 쓴 바이트 수를 반환한다.
+    /// 병렬 범위 다운로드·진행률·취소는 transfer::download가 담당한다(SPEC 4.4).
+    pub async fn download(
+        &self,
+        key: &str,
+        dest: &Path,
+        opts: &TransferOptions,
+        progress: &dyn ProgressSink,
+        cancel: &CancelToken,
+    ) -> Result<u64, Error> {
+        crate::transfer::download(&self.backend, key, dest, opts, progress, cancel).await
+    }
+
+    /// prefix 폴더의 하위 객체를 모두 dest_dir 아래 `<폴더 이름>`으로
+    /// 다운로드한다. 루트("")는 거부한다. 세부 규칙은 transfer::download_folder 참조.
+    pub async fn download_folder(
+        &self,
+        prefix: &str,
+        dest_dir: &Path,
+        opts: &TransferOptions,
+        progress: &dyn ProgressSink,
+        cancel: &CancelToken,
+    ) -> Result<FolderDownload, Error> {
+        crate::transfer::download_folder(&self.backend, prefix, dest_dir, opts, progress, cancel)
+            .await
     }
 }
 
@@ -150,39 +199,64 @@ fn now_ms() -> i64 {
 mod tests {
     use super::*;
     use std::collections::HashMap;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
 
-    /// list_folder 호출 횟수를 세는 가짜 백엔드.
+    /// 목록 내용을 바꿀 수 있는 가짜 백엔드.
+    /// `hold` 뮤텍스를 잡으면 list_folder가 그곳에서 멈춰
+    /// "갱신 진행 중" 상황을 만들 수 있다.
     #[derive(Clone, Default)]
     struct FakeBackend {
-        folders: Arc<HashMap<String, Vec<Item>>>,
+        folders: Arc<Mutex<HashMap<String, Vec<Item>>>>,
         list_calls: Arc<AtomicUsize>,
+        auth_fail: Arc<AtomicBool>,
+        hold: Arc<tokio::sync::Mutex<()>>,
     }
 
     impl FakeBackend {
-        fn with_folder(mut self, prefix: &str, items: Vec<Item>) -> Self {
-            Arc::make_mut(&mut self.folders).insert(prefix.to_string(), items);
+        fn with_folder(self, prefix: &str, items: Vec<Item>) -> Self {
+            self.set_folder(prefix, items);
             self
+        }
+
+        fn set_folder(&self, prefix: &str, items: Vec<Item>) {
+            self.folders
+                .lock()
+                .unwrap()
+                .insert(prefix.to_string(), items);
         }
 
         fn calls(&self) -> usize {
             self.list_calls.load(Ordering::SeqCst)
+        }
+
+        fn fail_auth(&self) {
+            self.auth_fail.store(true, Ordering::SeqCst);
         }
     }
 
     impl Backend for FakeBackend {
         async fn list_folder(&self, prefix: &str) -> Result<Vec<Item>, Error> {
             self.list_calls.fetch_add(1, Ordering::SeqCst);
-            Ok(self.folders.get(prefix).cloned().unwrap_or_default())
+            let _guard = self.hold.lock().await;
+            if self.auth_fail.load(Ordering::SeqCst) {
+                return Err(Error::Authentication("fake: 인증 실패".to_string()));
+            }
+            Ok(self
+                .folders
+                .lock()
+                .unwrap()
+                .get(prefix)
+                .cloned()
+                .unwrap_or_default())
+        }
+
+        async fn list_recursive(&self, _prefix: &str) -> Result<Vec<Item>, Error> {
+            Ok(vec![])
         }
 
         async fn stat(&self, key: &str) -> Result<Item, Error> {
             Err(Error::NotFound(key.to_string()))
-        }
-
-        async fn read_to_file(&self, _key: &str, _dest: &Path) -> Result<u64, Error> {
-            Err(Error::Other("fake backend".to_string()))
         }
     }
 
@@ -336,5 +410,122 @@ mod tests {
         let conn = Connection::with_backend(backend, MetadataStore::open_in_memory().unwrap());
         let page = conn.list_folder("n", None).await.unwrap();
         assert_eq!(page.items.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn refresh_reports_added_changed_and_removed() {
+        let backend = FakeBackend::default().with_folder(
+            "r/",
+            vec![
+                Item::file("r/a.txt", 1, Some("e1".to_string()), None),
+                Item::file("r/b.txt", 2, None, None),
+                Item::folder("r/sub/"),
+            ],
+        );
+        let conn =
+            Connection::with_backend(backend.clone(), MetadataStore::open_in_memory().unwrap());
+        conn.list_folder("r/", None).await.unwrap();
+
+        // 원격 변경: a.txt 메타데이터 변경, b.txt 삭제, c.txt·sub2/ 추가.
+        backend.set_folder(
+            "r/",
+            vec![
+                Item::file("r/a.txt", 9, Some("e2".to_string()), None),
+                Item::file("r/c.txt", 3, None, None),
+                Item::folder("r/sub/"),
+                Item::folder("r/sub2/"),
+            ],
+        );
+        let changes = conn.refresh("r/").await.unwrap();
+        let upserted: Vec<&str> = changes.upserted.iter().map(|i| i.key.as_str()).collect();
+        assert_eq!(upserted, ["r/a.txt", "r/c.txt", "r/sub2/"]);
+        assert_eq!(changes.removed, ["r/b.txt"]);
+
+        // 캐시도 새 목록으로 교체됐다.
+        let page = conn.list_folder("r/", None).await.unwrap();
+        assert!(page.from_cache);
+        let keys: Vec<&str> = page.items.iter().map(|i| i.key.as_str()).collect();
+        assert_eq!(keys, ["r/a.txt", "r/c.txt", "r/sub/", "r/sub2/"]);
+    }
+
+    #[tokio::test]
+    async fn refresh_clears_removed_folder_subtree() {
+        let backend = FakeBackend::default()
+            .with_folder(
+                "p/",
+                vec![Item::folder("p/sub/"), Item::file("p/a.txt", 1, None, None)],
+            )
+            .with_folder("p/sub/", vec![Item::file("p/sub/x.txt", 1, None, None)]);
+        let conn =
+            Connection::with_backend(backend.clone(), MetadataStore::open_in_memory().unwrap());
+        conn.list_folder("p/", None).await.unwrap();
+        conn.list_folder("p/sub/", None).await.unwrap();
+        assert!(conn.stat("p/sub/x.txt").await.is_ok());
+
+        // 원격에서 sub/ 전체가 사라졌다.
+        backend.set_folder("p/", vec![Item::file("p/a.txt", 1, None, None)]);
+        backend.set_folder("p/sub/", vec![]);
+        let changes = conn.refresh("p/").await.unwrap();
+        assert_eq!(changes.removed, ["p/sub/"]);
+
+        // 하위 캐시도 지워져 stat은 원격(NotFound)으로 간다.
+        let err = conn.stat("p/sub/x.txt").await.unwrap_err();
+        assert!(matches!(err, Error::NotFound(_)), "{err:?}");
+        // p/sub/ 폴더는 다시 원격 목록을 받는다(캐시가 지워졌다).
+        let page = conn.list_folder("p/sub/", None).await.unwrap();
+        assert!(!page.from_cache);
+        assert!(page.items.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cache_responds_while_refresh_in_flight() {
+        let backend = FakeBackend::default().with_folder("w/", file_items("w/", 3));
+        let conn = Arc::new(Connection::with_backend(
+            backend.clone(),
+            MetadataStore::open_in_memory().unwrap(),
+        ));
+        conn.list_folder("w/", None).await.unwrap();
+
+        // 원격 내용을 바꾸고 백엔드 호출을 붙잡는다.
+        backend.set_folder("w/", file_items("w/", 5));
+        let guard = backend.hold.lock().await;
+        let conn2 = Arc::clone(&conn);
+        let refresh = tokio::spawn(async move { conn2.refresh("w/").await });
+        // 백엔드가 호출됐는지 확인할 시간을 준다.
+        for _ in 0..100 {
+            if backend.calls() >= 2 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(backend.calls(), 2, "refresh의 원격 호출이 시작되지 않았다");
+
+        // 갱신 진행 중에도 list_folder는 이전 캐시로 즉시 응답한다.
+        let page = conn.list_folder("w/", None).await.unwrap();
+        assert!(page.from_cache);
+        assert_eq!(page.items.len(), 3);
+
+        drop(guard);
+        let changes = refresh.await.unwrap().unwrap();
+        assert_eq!(changes.upserted.len(), 2, "새 파일 2개만 추가됐다");
+        assert!(changes.removed.is_empty());
+
+        // 갱신 완료 후에는 새 캐시가 보인다.
+        let page = conn.list_folder("w/", None).await.unwrap();
+        assert_eq!(page.items.len(), 5);
+    }
+
+    #[tokio::test]
+    async fn test_connection_ok_and_error_propagation() {
+        let backend = FakeBackend::default();
+        let conn =
+            Connection::with_backend(backend.clone(), MetadataStore::open_in_memory().unwrap());
+        conn.test_connection().await.expect("연결 성공이어야 한다");
+        // 캐시에 아무것도 쓰지 않는다.
+        assert!(conn.lock().unwrap().folder_state("").unwrap().is_none());
+
+        backend.fail_auth();
+        let err = conn.test_connection().await.expect_err("실패해야 한다");
+        assert!(matches!(err, Error::Authentication(_)), "{err:?}");
     }
 }

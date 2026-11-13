@@ -9,6 +9,8 @@ services:
       dockerfile: minio.Dockerfile
     image: pier-minio:RELEASE.2025-10-15T17-29-55Z
     container_name: pier-minio
+    # Docker Desktop 재시작 후 컨테이너가 Exited로 남지 않고 자동으로 다시 뜨게 한다.
+    restart: unless-stopped
     command: server /data --console-address ":9001"
     ports:
       - "127.0.0.1:9000:9000"

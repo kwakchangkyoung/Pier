@@ -8,7 +8,15 @@ use opendal::Operator;
 use pier_core::config::{ConnectionConfig, Provider};
 use pier_core::enumerate::Connection;
 use pier_core::error::Error;
+use pier_core::transfer::{CancelToken, ProgressSink, TransferOptions};
 use pier_core::Item;
+
+/// 진행률을 무시하는 테스트용 싱크.
+struct NoopProgress;
+
+impl ProgressSink for NoopProgress {
+    fn on_progress(&self, _transferred: u64, _total: u64) {}
+}
 
 fn minio_enabled() -> bool {
     std::env::var("PIER_TEST_MINIO").as_deref() == Ok("1")
@@ -362,7 +370,13 @@ fn stat_and_read_minio() {
         let dest =
             std::env::temp_dir().join(format!("pier-read-{}-korean.txt", std::process::id()));
         let written = conn
-            .download("한글 파일.txt", &dest)
+            .download(
+                "한글 파일.txt",
+                &dest,
+                &TransferOptions::default(),
+                &NoopProgress,
+                &CancelToken::new(),
+            )
             .await
             .expect("download 실패");
         assert_eq!(written, 49);
@@ -374,7 +388,13 @@ fn stat_and_read_minio() {
         let missing_dest =
             std::env::temp_dir().join(format!("pier-read-{}-missing.txt", std::process::id()));
         let err = conn
-            .download("없는키", &missing_dest)
+            .download(
+                "없는키",
+                &missing_dest,
+                &TransferOptions::default(),
+                &NoopProgress,
+                &CancelToken::new(),
+            )
             .await
             .expect_err("NotFound여야 한다");
         assert!(
@@ -384,6 +404,108 @@ fn stat_and_read_minio() {
         assert!(
             !missing_dest.exists(),
             "실패한 다운로드의 부분 파일이 남았다"
+        );
+    });
+}
+
+#[test]
+fn refresh_detects_add_and_delete_minio() {
+    if !minio_enabled() {
+        return;
+    }
+    let _cache = TempDir::new("refresh");
+    runtime().block_on(async {
+        let operator = minio_operator();
+        ensure_seeded(&operator).await;
+        // 이전 실패 실행의 잔여물을 지워 멱등하게 만든다.
+        let _ = operator.delete("docs/p2-refresh/a.txt").await;
+        let _ = operator.delete("docs/p2-refresh/sub/b.txt").await;
+
+        let conn = open_conn(&_cache.0);
+        let prefix = "docs/p2-refresh/";
+
+        // 대상 폴더가 아직 없으면 빈 목록으로 complete 표시된다.
+        let changes = conn.refresh(prefix).await.expect("초기 refresh 실패");
+        assert!(changes.upserted.is_empty());
+        assert!(changes.removed.is_empty());
+
+        // 파일 1개와 하위 폴더 안 파일 1개를 쓴다.
+        operator
+            .write("docs/p2-refresh/a.txt", b"a".to_vec())
+            .await
+            .expect("쓰기 실패");
+        operator
+            .write("docs/p2-refresh/sub/b.txt", b"b".to_vec())
+            .await
+            .expect("쓰기 실패");
+
+        // refresh가 추가를 잡는다: a.txt와 CommonPrefix 폴더 sub/.
+        let changes = conn.refresh(prefix).await.expect("refresh 실패");
+        let upserted: HashSet<&str> = changes.upserted.iter().map(|i| i.key.as_str()).collect();
+        assert!(upserted.contains("docs/p2-refresh/a.txt"), "{upserted:?}");
+        assert!(upserted.contains("docs/p2-refresh/sub/"), "{upserted:?}");
+        assert!(changes.removed.is_empty());
+
+        // a.txt 삭제 → removed에 나타나고 캐시에서도 사라진다.
+        operator
+            .delete("docs/p2-refresh/a.txt")
+            .await
+            .expect("삭제 실패");
+        let changes = conn.refresh(prefix).await.expect("refresh 실패");
+        assert_eq!(changes.removed, ["docs/p2-refresh/a.txt"]);
+        assert!(
+            !changes
+                .upserted
+                .iter()
+                .any(|i| i.key == "docs/p2-refresh/sub/"),
+            "변하지 않은 폴더가 upserted에 들어갔다"
+        );
+        let err = conn
+            .stat("docs/p2-refresh/a.txt")
+            .await
+            .expect_err("캐시에 없어야 한다");
+        assert!(matches!(err, Error::NotFound(_)), "{err:?}");
+
+        // sub/b.txt 삭제 → sub/ 폴더 자체가 사라지고 하위 캐시도 정리된다.
+        operator
+            .delete("docs/p2-refresh/sub/b.txt")
+            .await
+            .expect("삭제 실패");
+        let changes = conn.refresh(prefix).await.expect("refresh 실패");
+        assert_eq!(changes.removed, ["docs/p2-refresh/sub/"]);
+        let page = conn
+            .list_folder(prefix, None)
+            .await
+            .expect("빈 폴더 목록 조회 실패");
+        assert!(page.items.is_empty());
+        assert!(page.from_cache, "갱신 후 캐시가 complete여야 한다");
+    });
+}
+
+#[test]
+fn test_connection_minio() {
+    if !minio_enabled() {
+        return;
+    }
+    let _cache = TempDir::new("testconn");
+    let _bad_cache = TempDir::new("testconn-bad");
+    runtime().block_on(async {
+        // 올바른 시크릿 → 성공.
+        let conn = open_conn(&_cache.0);
+        conn.test_connection()
+            .await
+            .expect("test_connection이 실패했다");
+
+        // 잘못된 시크릿 → Authentication 에러가 전파된다.
+        let bad = Connection::open(&minio_config(), "wrong-secret", &_bad_cache.0)
+            .expect("연결 생성 실패");
+        let err = bad
+            .test_connection()
+            .await
+            .expect_err("Authentication이어야 한다");
+        assert!(
+            matches!(err, Error::Authentication(_)),
+            "Authentication이 아니다: {err:?}"
         );
     });
 }

@@ -1,8 +1,10 @@
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use pier_core::config::{ConnectionConfig, Provider};
 use pier_core::enumerate::Connection;
-use pier_core::Item;
+use pier_core::transfer::{self, CancelToken, ProgressSink, TransferOptions};
+use pier_core::{Item, OpendalS3};
 
 fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
@@ -26,6 +28,31 @@ fn cache_dir() -> PathBuf {
     std::env::var_os("PIER_CACHE_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("target/pier-cli-cache"))
+}
+
+fn env_u64(key: &str, default: u64) -> u64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
+/// 퍼센트가 바뀔 때만 진행률을 찍는 CLI용 싱크.
+#[derive(Default)]
+struct CliProgress(AtomicU64);
+
+impl ProgressSink for CliProgress {
+    fn on_progress(&self, transferred: u64, total: u64) {
+        let pct = transferred
+            .saturating_mul(100)
+            .checked_div(total)
+            .unwrap_or(100);
+        let last = self.0.load(Ordering::Relaxed);
+        if pct != last {
+            self.0.store(pct, Ordering::Relaxed);
+            eprintln!("진행률 {pct}% ({transferred}/{total} bytes)");
+        }
+    }
 }
 
 fn print_item(item: &Item) {
@@ -63,6 +90,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             eprintln!("{count}개 항목 ({source})");
             Ok(())
         }
+        Some("refresh") => {
+            let prefix = args.get(2).map(String::as_str).unwrap_or("");
+            let changes = conn.refresh(prefix).await?;
+            for item in &changes.upserted {
+                print_item(item);
+            }
+            for key in &changes.removed {
+                println!("removed {key}");
+            }
+            eprintln!(
+                "upserted {}개, removed {}개",
+                changes.upserted.len(),
+                changes.removed.len()
+            );
+            Ok(())
+        }
         Some("stat") => {
             let key = args.get(2).ok_or("사용법: cli stat <key>")?;
             let item = conn.stat(key).await?;
@@ -78,12 +121,68 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some("get") => {
             let key = args.get(2).ok_or("사용법: cli get <key> <dest>")?;
             let dest = args.get(3).ok_or("사용법: cli get <key> <dest>")?;
-            let written = conn.download(key, &PathBuf::from(dest)).await?;
-            eprintln!("{written} bytes -> {dest}");
+            // 다운로드는 캐시를 쓰지 않으므로 백엔드를 직접 연다.
+            let backend = OpendalS3::new(&minio_config(), &secret)?;
+            let opts = TransferOptions {
+                chunk_size: env_u64("PIER_CHUNK_MB", 8).saturating_mul(1024 * 1024),
+                concurrency: env_u64("PIER_CONCURRENCY", 8) as usize,
+            };
+            let progress = CliProgress::default();
+            let start = std::time::Instant::now();
+            let written = transfer::download(
+                &backend,
+                key,
+                &PathBuf::from(dest),
+                &opts,
+                &progress,
+                &CancelToken::new(),
+            )
+            .await?;
+            let secs = start.elapsed().as_secs_f64();
+            let mb = written as f64 / (1024.0 * 1024.0);
+            eprintln!(
+                "{written} bytes -> {dest} ({secs:.2}s, {:.1} MB/s)",
+                mb / secs
+            );
+            Ok(())
+        }
+        Some("get-dir") => {
+            let prefix = args
+                .get(2)
+                .ok_or("사용법: cli get-dir <prefix> <dest_dir>")?;
+            let dest = args
+                .get(3)
+                .ok_or("사용법: cli get-dir <prefix> <dest_dir>")?;
+            // 폴더 다운로드도 캐시를 쓰지 않으므로 백엔드를 직접 연다.
+            let backend = OpendalS3::new(&minio_config(), &secret)?;
+            let opts = TransferOptions {
+                chunk_size: env_u64("PIER_CHUNK_MB", 8).saturating_mul(1024 * 1024),
+                concurrency: env_u64("PIER_CONCURRENCY", 8) as usize,
+            };
+            let progress = CliProgress::default();
+            let start = std::time::Instant::now();
+            let result = transfer::download_folder(
+                &backend,
+                prefix,
+                &PathBuf::from(dest),
+                &opts,
+                &progress,
+                &CancelToken::new(),
+            )
+            .await?;
+            let secs = start.elapsed().as_secs_f64();
+            let mb = result.total_bytes as f64 / (1024.0 * 1024.0);
+            eprintln!(
+                "{}개 파일, {} bytes -> {} ({secs:.2}s, {:.1} MB/s)",
+                result.file_count,
+                result.total_bytes,
+                result.local_path.display(),
+                mb / secs
+            );
             Ok(())
         }
         _ => {
-            eprintln!("사용법: cli ls [폴더] | cli stat <key> | cli get <key> <dest>");
+            eprintln!("사용법: cli ls [폴더] | cli refresh [폴더] | cli stat <key> | cli get <key> <dest> | cli get-dir <prefix> <dest_dir>");
             std::process::exit(2);
         }
     }
