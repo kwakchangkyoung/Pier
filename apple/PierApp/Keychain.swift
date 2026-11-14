@@ -2,9 +2,9 @@ import Foundation
 import Security
 
 /// 로그인 키체인 기반 시크릿 저장소.
-/// service = `com.yourname.pier`, account = connection id (UUID 문자열).
+/// service = `com.gajago.pier`, account = connection id (UUID 문자열).
 enum Keychain {
-    static let service = "com.yourname.pier"
+    static let service = "com.gajago.pier"
 
     enum KeychainError: Error {
         /// load에서 항목을 찾지 못했을 때.

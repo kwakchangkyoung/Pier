@@ -1,6 +1,6 @@
 import Foundation
 
-/// `~/Library/Application Support/com.yourname.pier/connections.json`에 저장되는 연결 정보.
+/// `~/Library/Application Support/com.gajago.pier/connections.json`에 저장되는 연결 정보.
 /// 시크릿 Access Key는 이 구조체에 넣지 않고 키체인에 별도로 저장한다(SPEC 6.1).
 struct SavedConnection: Codable, Identifiable, Hashable {
     var id: UUID

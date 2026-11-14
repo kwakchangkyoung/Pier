@@ -60,11 +60,11 @@ cd apple && xcodegen generate
 xcodebuild -project apple/Pier.xcodeproj -scheme Pier -configuration Debug CODE_SIGNING_ALLOWED=NO build
 
 # 앱 로그 확인
-log stream --predicate 'subsystem BEGINSWITH "com.yourname.pier"'
+log stream --predicate 'subsystem BEGINSWITH "com.gajago.pier"'
 ```
 
-## 식별자 (자리표시자, 확정 후 일괄 변경)
+## 식별자
 
-- 앱 번들 ID: `com.yourname.pier`
-- 키체인 service: `com.yourname.pier` (account = connection id)
-- 로그 subsystem: `com.yourname.pier`
+- 앱 번들 ID: `com.gajago.pier`
+- 키체인 service: `com.gajago.pier` (account = connection id)
+- 로그 subsystem: `com.gajago.pier`

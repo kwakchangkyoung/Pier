@@ -10,6 +10,8 @@ struct PierApp: App {
     init() {
         // 코어 로그를 os_log로 보내는 싱크는 한 번만 설치한다.
         setLogSink(sink: CoreLogSink())
+        // 옛 번들 ID 데이터 이관은 ConnectionStore가 connections.json을 읽기 전에 끝낸다.
+        LegacyMigration.runIfNeeded()
         _store = State(initialValue: ConnectionStore())
         _sessions = State(initialValue: PierSessions())
         _transfers = State(initialValue: TransferManager())

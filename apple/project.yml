@@ -1,6 +1,6 @@
 name: Pier
 options:
-  bundleIdPrefix: com.yourname
+  bundleIdPrefix: com.gajago
   deploymentTarget:
     macOS: "14.0"
   createIntermediateGroups: true
@@ -37,7 +37,7 @@ targets:
       - sdk: CoreFoundation.framework
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.yourname.pier
+        PRODUCT_BUNDLE_IDENTIFIER: com.gajago.pier
         INFOPLIST_FILE: Config/PierApp-Info.plist
         # Rust 코어(reqwest 등)가 요구하는 libresolv
         OTHER_LDFLAGS: "$(inherited) -lresolv"

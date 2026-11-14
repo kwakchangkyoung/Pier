@@ -63,7 +63,7 @@ struct FileTableView: NSViewRepresentable {
         // 내부 이동은 .move, 외부(Finder) 드롭은 모든 연산을 허용한다.
         tableView.setDraggingSourceOperationMask(.move, forLocal: true)
         tableView.setDraggingSourceOperationMask(.every, forLocal: false)
-        // 내부 이동 마커(com.yourname.pier.entry-keys)와 Finder 파일 URL을 받는다.
+        // 내부 이동 마커(com.gajago.pier.entry-keys)와 Finder 파일 URL을 받는다.
         tableView.registerForDraggedTypes([PierDragTypes.entryKeys, .fileURL])
 
         let menu = NSMenu()

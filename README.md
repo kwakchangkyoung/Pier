@@ -4,7 +4,7 @@ S3 호환 버킷을 탐색하고 파일을 주고받는 macOS 앱입니다. Find
 
 ![Pier 메인 창 — 사이드바의 연결 목록과 버킷 루트의 파일·폴더 목록](docs/images/main-window.png)
 
-- 현재 버전: **0.1.0** (앱 이름과 번들 ID `com.yourname.pier`는 가칭)
+- 현재 버전: **0.1.0** (앱 이름은 가칭)
 - 요구 사항: **macOS 14 이상, Apple Silicon**
 - 라이선스: **MIT OR Apache-2.0**
 
@@ -54,9 +54,9 @@ S3 호환 버킷을 탐색하고 파일을 주고받는 macOS 앱입니다. Find
 
 ## 설치
 
-DMG는 GitHub Releases에 올릴 예정입니다. 아직 릴리스가 없으므로 지금은 아래 "소스에서 빌드"로 설치할 수 있습니다.
+[GitHub Releases](https://github.com/kwakchangkyoung/Pier/releases/latest)에서 최신 `Pier-<버전>.dmg`를 내려받습니다. 소스에서 직접 빌드하려면 아래 "소스에서 빌드"를 참고하세요.
 
-1. `Pier-0.1.0.dmg`를 열고 `Pier.app`을 `Applications`로 드래그합니다.
+1. 내려받은 DMG를 열고 `Pier.app`을 `Applications`로 드래그합니다.
 2. 서명되지 않은 앱(ad-hoc 서명)이므로 첫 실행 시 Gatekeeper가 차단합니다.
    - **시스템 설정 > 개인정보 보호 및 보안**에서 "확인 없이 열기"를 눌러 열거나,
    - 터미널에서 `xattr -dr com.apple.quarantine /Applications/Pier.app`을 실행합니다.
@@ -185,7 +185,7 @@ PIER_TEST_ACCESS_KEY=<키> PIER_TEST_SECRET_KEY=<시크릿> \
 ## 보안·개인정보
 
 - Secret Access Key는 로그인 키체인(`kSecClassGenericPassword`)에만 저장하고, 연결을 열 때만 코어에 전달합니다. 디스크·SQLite·에러 메시지에 남기지 않습니다.
-- 로그(통합 로그 subsystem `com.yourname.pier`)에 액세스 키, 시크릿, presigned URL 전체 값을 기록하지 않습니다.
+- 로그(통합 로그 subsystem `com.gajago.pier`)에 액세스 키, 시크릿, presigned URL 전체 값을 기록하지 않습니다.
 - App Sandbox는 사용하지 않습니다.
 - 수집하는 데이터는 없습니다. 모든 통신은 설정한 S3 엔드포인트와만 이뤄집니다.
 
@@ -195,7 +195,7 @@ PIER_TEST_ACCESS_KEY=<키> PIER_TEST_SECRET_KEY=<시크릿> \
 - 객체가 매우 많은 폴더(수만 개 이상)는 첫 화면 표시가 전체 목록 수신 시간만큼 걸립니다.
 - 폴더 이름 변경은 하위 객체가 1,000개를 넘으면 거부됩니다.
 - 서명되지 않은 배포(ad-hoc 서명)라 첫 실행 시 Gatekeeper 확인이 필요합니다.
-- 앱 이름·번들 ID는 가칭(`com.yourname.pier`)이며, ad-hoc 서명 개발 빌드는 재빌드 후 키체인 접근 허용 대화상자가 다시 뜰 수 있습니다.
+- 앱 이름은 가칭이며, ad-hoc 서명 개발 빌드는 재빌드 후 키체인 접근 허용 대화상자가 다시 뜰 수 있습니다.
 
 ## 라이선스
 

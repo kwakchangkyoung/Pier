@@ -2,9 +2,9 @@ import Foundation
 
 /// 앱이 사용하는 파일시스템 위치 모음.
 enum PierPaths {
-    private static let appDirectoryName = "com.yourname.pier"
+    private static let appDirectoryName = "com.gajago.pier"
 
-    /// `~/Library/Application Support/com.yourname.pier`
+    /// `~/Library/Application Support/com.gajago.pier`
     static var applicationSupportDirectory: URL {
         FileManager.default
             .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -16,14 +16,14 @@ enum PierPaths {
         applicationSupportDirectory.appendingPathComponent("connections.json")
     }
 
-    /// `~/Library/Caches/com.yourname.pier`
+    /// `~/Library/Caches/com.gajago.pier`
     private static var cachesRoot: URL {
         FileManager.default
             .urls(for: .cachesDirectory, in: .userDomainMask)[0]
             .appendingPathComponent(appDirectoryName, isDirectory: true)
     }
 
-    /// 연결별 캐시 디렉터리. `~/Library/Caches/com.yourname.pier/connections/<id>/`
+    /// 연결별 캐시 디렉터리. `~/Library/Caches/com.gajago.pier/connections/<id>/`
     static func cacheDirectory(for connectionId: UUID) -> URL {
         cachesRoot
             .appendingPathComponent("connections", isDirectory: true)

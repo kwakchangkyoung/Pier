@@ -134,7 +134,7 @@ pub struct ConnectionConfig {
 
 ### 4.2 메타데이터 캐시 (SQLite)
 
-- 위치: `~/Library/Caches/com.yourname.pier/connections/<connection_id>/metadata.sqlite`. 캐시이므로 삭제돼도 복구 가능하다. WAL 모드.
+- 위치: `~/Library/Caches/com.gajago.pier/connections/<connection_id>/metadata.sqlite`. 캐시이므로 삭제돼도 복구 가능하다. WAL 모드.
 - 테이블 초안:
   - `items(key PK, parent, is_dir, size, etag, last_modified, storage_class, seen_at)`
   - `folders(prefix PK, last_listed_at, last_opened_at, complete)`
@@ -215,7 +215,7 @@ pub struct ConnectionConfig {
 ### 6.1 메인 창과 연결 관리
 
 - **메인 창:** 사이드바에 연결 목록, 본문에 파일 테이블(이름, 크기, 수정 시각), 경로 표시줄(breadcrumb), 툴바(새로고침, 업로드, 새 폴더, 다운로드). 폴더 더블클릭으로 진입하고 뒤로/앞으로 이동을 지원한다.
-- **연결 관리 설정 창:** 연결 추가·편집·삭제. 프리셋 선택 → 필요한 필드만 표시 → "연결 테스트" 성공 시에만 저장. 시크릿은 로그인 키체인(`kSecClassGenericPassword`, service `com.yourname.pier`, account = connection id)에 저장하고, 설정은 `~/Library/Application Support/com.yourname.pier/connections.json`에 저장한다. 연결 삭제 시 키체인 항목과 캐시까지 삭제한다.
+- **연결 관리 설정 창:** 연결 추가·편집·삭제. 프리셋 선택 → 필요한 필드만 표시 → "연결 테스트" 성공 시에만 저장. 시크릿은 로그인 키체인(`kSecClassGenericPassword`, service `com.gajago.pier`, account = connection id)에 저장하고, 설정은 `~/Library/Application Support/com.gajago.pier/connections.json`에 저장한다. 연결 삭제 시 키체인 항목과 캐시까지 삭제한다.
 
 ### 6.2 메뉴바 (`MenuBarExtra`)
 

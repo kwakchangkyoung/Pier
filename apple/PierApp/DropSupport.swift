@@ -4,7 +4,7 @@ import UniformTypeIdentifiers
 /// 앱 내부 드래그(항목 이동)를 나타내는 pasteboard 타입.
 /// NSTableView의 draggingSession:willBeginAtPoint에서 JSON 배열로 쓴다.
 enum PierDragTypes {
-    static let entryKeys = NSPasteboard.PasteboardType("com.yourname.pier.entry-keys")
+    static let entryKeys = NSPasteboard.PasteboardType("com.gajago.pier.entry-keys")
     /// UTType으로도 등록해야 SwiftUI onDrop이 받을 수 있다.
     static let entryKeysType = UTType(exportedAs: entryKeys.rawValue, conformingTo: .data)
 }
