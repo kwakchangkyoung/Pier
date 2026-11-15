@@ -63,8 +63,9 @@ extension BrowserView {
         }
     }
 
+    /// 선택 항목을 표시 배열 기준으로 푼다. 필터로 숨겨진 항목은 동작 대상에서 빠진다.
     var selectedEntries: [PierEntry] {
-        model.entries.filter { selection.contains($0.identifier) }
+        model.displayedEntries.filter { selection.contains($0.identifier) }
     }
 
     /// 선택 항목이 하나라도 있으면 다운로드할 수 있다(파일·폴더 모두 지원).

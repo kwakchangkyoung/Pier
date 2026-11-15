@@ -5,7 +5,12 @@ import SwiftUI
 /// 데이터 소스/델리게이트는 FileTableCoordinator, 드래그 앤 드롭은
 /// FileTableDragDrop extension이 담당한다.
 struct FileTableView: NSViewRepresentable {
+    /// 표시 배열(정렬·필터 적용 결과). 행 번호는 이 배열의 인덱스다.
     let entries: [PierEntry]
+    /// 현재 정렬. 열 머리글 화살표 표시에 쓴다.
+    let sort: EntrySort
+    /// 열 머리글 클릭으로 정렬이 바뀌면 호출. 실제 정렬은 모델이 한다.
+    let onSortChange: @MainActor (EntrySort) -> Void
     @Binding var selection: Set<String>
     /// 행 위가 아닌 곳에 드롭했을 때의 대상 부모 폴더 키(현재 폴더).
     let currentParent: String
@@ -54,6 +59,10 @@ struct FileTableView: NSViewRepresentable {
         for column in Self.makeColumns() {
             tableView.addTableColumn(column)
         }
+        // 열 머리글의 정렬 화살표를 현재 정렬 상태로 표시한다.
+        tableView.sortDescriptors = [
+            NSSortDescriptor(key: sort.key.rawValue, ascending: sort.ascending)
+        ]
 
         tableView.dataSource = context.coordinator
         tableView.delegate = context.coordinator
@@ -111,6 +120,8 @@ struct FileTableView: NSViewRepresentable {
             column.title = title
             column.width = width
             column.minWidth = width * 0.5
+            // 열 머리글 클릭 정렬용 프로토타입. 키는 ColumnID = EntrySortKey raw 값.
+            column.sortDescriptorPrototype = NSSortDescriptor(key: id.rawValue, ascending: true)
             return column
         }
         return [
@@ -157,5 +168,27 @@ struct FileTableView: NSViewRepresentable {
         }
         item.submenu = submenu
         return item
+    }
+}
+
+/// 열 머리글 정렬 클릭 연결. 실제 정렬 계산은 모델이 표시 배열에 적용한다.
+extension FileTableView.Coordinator {
+    @objc func tableView(_ tableView: NSTableView, sortDescriptorsDidChange oldDescriptors: [NSSortDescriptor]) {
+        guard let descriptor = tableView.sortDescriptors.first,
+            let key = descriptor.key.flatMap({ EntrySortKey(rawValue: $0) })
+        else { return }
+        MainActor.assumeIsolated {
+            parent.onSortChange(EntrySort(key: key, ascending: descriptor.ascending))
+        }
+    }
+
+    /// 모델의 정렬 상태가 바뀌었으면 열 머리글 화살표를 맞춘다. sync에서 호출한다.
+    func syncSortDescriptors(_ tableView: NSTableView) {
+        let current = tableView.sortDescriptors.first
+        if current?.key != parent.sort.key.rawValue || current?.ascending != parent.sort.ascending {
+            tableView.sortDescriptors = [
+                NSSortDescriptor(key: parent.sort.key.rawValue, ascending: parent.sort.ascending)
+            ]
+        }
     }
 }

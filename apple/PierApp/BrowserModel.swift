@@ -18,11 +18,17 @@ final class BrowserModel {
     /// 다운로드에 사용하는 열려 있는 코어 연결. open 성공 후에만 non-nil.
     private(set) var connection: PierConnection?
 
+    /// 표시 상태(정렬·이름 필터와 계산된 표시 배열). 계산은 BrowserDisplay가 한다.
+    let display = BrowserDisplay()
+
     /// 연결 설정의 쓰기 권한. false면 업로드·이름 변경·이동·삭제 UI를 비활성화한다.
     let canWrite: Bool
 
     /// 현재 폴더의 항목. 키 순(코어가 주는 순서)으로 정렬돼 있다.
-    private(set) var entries: [PierEntry] = []
+    /// 화면에 보이는 배열은 이 원본에 정렬·필터를 적용한 display.entries다.
+    private(set) var entries: [PierEntry] = [] {
+        didSet { display.update(entries) }
+    }
     private(set) var phase: Phase = .idle
     /// 백그라운드 refresh 진행 중 여부(툴바 스피너 표시용).
     private(set) var isRefreshing = false
@@ -115,8 +121,9 @@ final class BrowserModel {
 
     // MARK: - 내부
 
-    /// 폴더가 바뀌는 이동: 이전 목록을 지우고 로드를 시작한다.
+    /// 폴더가 바뀌는 이동: 검색어와 이전 목록을 지우고 로드를 시작한다.
     private func moveAndReload() {
+        display.searchQuery = ""
         entries = []
         phase = .loading
         reload()

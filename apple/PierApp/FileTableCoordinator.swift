@@ -44,8 +44,9 @@ extension FileTableView {
 
         // MARK: 선택 동기화
 
-        /// SwiftUI 상태(entries/selection)를 테이블에 반영한다.
+        /// SwiftUI 상태(entries/selection/정렬)를 테이블에 반영한다.
         func sync(entries newEntries: [PierEntry], selection newSelection: Set<String>, tableView: NSTableView) {
+            syncSortDescriptors(tableView)
             let entriesChanged = newEntries != entries
             entries = newEntries
             if entriesChanged {

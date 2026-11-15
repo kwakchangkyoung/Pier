@@ -51,12 +51,24 @@ struct BrowserView: View {
                 Divider()
             }
             content
+            if model.isFiltering {
+                Divider()
+                filterStatusBar
+            }
             if !transfers.items.isEmpty {
                 QueuePanel(manager: transfers)
             }
         }
         .navigationTitle(model.title)
         .toolbar { toolbarItems }
+        // 툴바 검색 필드. ⌘F로 포커스되고, 입력은 현재 폴더 이름 필터다.
+        .searchable(
+            text: Binding(
+                get: { model.searchQuery },
+                set: { model.searchQuery = $0 }),
+            placement: .toolbar,
+            prompt: "현재 폴더에서 이름 검색"
+        )
         .onChange(of: selection) { _, _ in
             preview.selectionDidChange(selected: selectedEntries)
         }
@@ -138,67 +150,20 @@ struct BrowserView: View {
         )
     }
 
-    // MARK: - breadcrumb
-
-    var breadcrumbBar: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 2) {
-                ForEach(model.path.indices, id: \.self) { index in
-                    if index > 0 {
-                        Image(systemName: "chevron.right")
-                            .font(.caption2)
-                            .foregroundStyle(.tertiary)
-                    }
-                    Button {
-                        model.jumpToBreadcrumb(index)
-                    } label: {
-                        Text(segmentTitle(at: index))
-                            .lineLimit(1)
-                    }
-                    .buttonStyle(.plain)
-                    .font(index == model.path.count - 1 ? .body.weight(.medium) : .body)
-                    .foregroundStyle(index == model.path.count - 1 ? .primary : .secondary)
-                    // 경로 구간에 놓으면 그 폴더로 이동/업로드한다.
-                    .onDrop(of: RemoteDropDelegate.types, delegate: dropDelegate(for: model.path[index]))
-                }
-            }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 7)
-        }
-    }
-
-    func segmentTitle(at index: Int) -> String {
-        let folder = model.path[index]
-        guard !folder.isEmpty else { return model.title }
-        let trimmed = folder.hasSuffix("/") ? String(folder.dropLast()) : folder
-        return trimmed.split(separator: "/").last.map(String.init) ?? folder
-    }
-
-    /// breadcrumb 구간/빈 영역용 SwiftUI 드롭 델리게이트.
-    func dropDelegate(for parent: String) -> RemoteDropDelegate {
-        RemoteDropDelegate(parentKey: parent) { payload, target in
-            handleDrop(payload: payload, parent: target)
-        }
-    }
-
-    /// 외부 파일은 업로드, 내부 항목 키는 이동으로 처리한다.
-    func handleDrop(payload: DropPayload, parent: String) {
-        guard model.canWrite, model.connection != nil else { return }
-        if !payload.keys.isEmpty {
-            Task {
-                do {
-                    try await model.moveEntries(keys: payload.keys, toParent: parent)
-                } catch {
-                    actionError = PierErrorPresenter.message(for: error) ?? "이동에 실패했습니다."
-                }
-            }
-        }
-        if !payload.urls.isEmpty {
-            startUploads(payload.urls, parent: parent)
-        }
-    }
-
     // MARK: - 내용
+
+    /// 필터 결과 요약 표시줄. 필터가 켜져 있을 때만 목록 아래에 보인다.
+    var filterStatusBar: some View {
+        HStack {
+            Text("전체 \(model.entries.count)개 중 \(model.displayedEntries.count)개")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Spacer()
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 4)
+        .background(.bar)
+    }
 
     /// 목록이 있는데 phase가 failed면 상단에 오류 배너를 띄운다(갱신 실패 등).
     var errorBannerMessage: String? {
@@ -228,9 +193,21 @@ struct BrowserView: View {
             emptyState
                 // 빈 폴더/로딩 영역에 놓인 드롭도 현재 폴더 대상으로 처리한다.
                 .onDrop(of: RemoteDropDelegate.types, delegate: dropDelegate(for: model.currentFolder))
+        } else if model.displayedEntries.isEmpty {
+            // 목록은 있는데 이름 필터에 걸린 경우.
+            ContentUnavailableView(
+                "‘\(model.trimmedQuery)’와 일치하는 항목이 없습니다",
+                systemImage: "magnifyingglass"
+            )
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .onDrop(of: RemoteDropDelegate.types, delegate: dropDelegate(for: model.currentFolder))
         } else {
             FileTableView(
-                entries: model.entries,
+                entries: model.displayedEntries,
+                sort: model.sort,
+                onSortChange: { sort in
+                    model.applySort(sort)
+                },
                 selection: $selection,
                 currentParent: model.currentFolder,
                 canWrite: model.canWrite,
