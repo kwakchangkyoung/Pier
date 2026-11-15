@@ -1,4 +1,5 @@
 import AppKit
+import UniformTypeIdentifiers
 
 /// FileTableView.Coordinator의 핵심: 데이터 소스/델리게이트, 선택 동기화,
 /// 셀 구성, 컨텍스트 메뉴 동작, 키보드 단축키 연결.
@@ -15,6 +16,8 @@ extension FileTableView {
         private var lastSelection: Set<String> = []
         /// reloadData/프로그램적 선택 변경 중에는 selectionDidChange를 무시한다.
         private var isSyncingSelection = false
+        /// UTType별 시스템 아이콘 캐시. AppKit 콜백은 모두 메인 스레드라 락 없이 쓴다.
+        private var iconCache: [String: NSImage] = [:]
 
         init(parent: FileTableView) {
             self.parent = parent
@@ -232,9 +235,14 @@ extension FileTableView {
             switch column {
             case FileTableView.ColumnID.name.rawValue:
                 if let imageView = cell.viewWithTag(1) as? NSImageView {
-                    let symbol = entry.isDir ? "folder" : "doc"
-                    imageView.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)
+                    imageView.image = icon(for: entry)
                 }
+                // 폴더는 이름을 살짝 굵게 해 파일과 한눈에 구분한다.
+                // 셀 재사용을 고려해 매번 폰트를 다시 지정한다.
+                textField.font =
+                    entry.isDir
+                    ? NSFont.systemFont(ofSize: NSFont.systemFontSize, weight: .medium)
+                    : NSFont.systemFont(ofSize: NSFont.systemFontSize)
                 textField.stringValue = entry.name
                 cell.toolTip = entry.identifier
             case FileTableView.ColumnID.size.rawValue:
@@ -254,6 +262,33 @@ extension FileTableView {
             default:
                 break
             }
+        }
+
+        // MARK: 아이콘
+
+        /// Finder처럼 macOS 시스템 아이콘을 쓴다. 폴더는 파란 폴더,
+        /// 파일은 이름 확장자로 구한 UTType의 아이콘(모르면 .data).
+        /// 확장자만 보고 판단하므로 네트워크/파일 접근이 없다.
+        private func icon(for entry: PierEntry) -> NSImage {
+            if entry.isDir {
+                return cachedIcon(key: "folder") {
+                    NSWorkspace.shared.icon(for: .folder)
+                }
+            }
+            let ext = (entry.name as NSString).pathExtension
+            let type = UTType(filenameExtension: ext) ?? .data
+            return cachedIcon(key: type.identifier) {
+                NSWorkspace.shared.icon(for: type)
+            }
+        }
+
+        /// 같은 타입의 아이콘을 행마다 새로 만들지 않도록 캐시한다.
+        private func cachedIcon(key: String, make: () -> NSImage) -> NSImage {
+            if let cached = iconCache[key] { return cached }
+            let icon = make()
+            icon.size = NSSize(width: 16, height: 16)
+            iconCache[key] = icon
+            return icon
         }
     }
 }

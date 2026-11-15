@@ -27,6 +27,7 @@ targets:
     platform: macOS
     sources:
       - path: PierApp
+      - path: Assets.xcassets
       - path: Generated/pier_ffi.swift
         optional: true
     dependencies:
@@ -39,5 +40,6 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.gajago.pier
         INFOPLIST_FILE: Config/PierApp-Info.plist
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         # Rust 코어(reqwest 등)가 요구하는 libresolv
         OTHER_LDFLAGS: "$(inherited) -lresolv"
