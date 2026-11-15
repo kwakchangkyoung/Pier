@@ -6,6 +6,7 @@ struct MenuBarContent: View {
     let store: ConnectionStore
     let sessions: PierSessions
     let transfers: TransferManager
+    let updater: UpdaterController
     @Environment(\.openWindow) private var openWindow
     @Environment(\.openSettings) private var openSettings
 
@@ -43,6 +44,10 @@ struct MenuBarContent: View {
         }
         .disabled(sessions.activeBrowser == nil)
         Divider()
+        Button("업데이트 확인…") {
+            updater.checkForUpdates()
+        }
+        .disabled(!updater.canCheckForUpdates)
         Button("설정…") {
             openSettings()
         }

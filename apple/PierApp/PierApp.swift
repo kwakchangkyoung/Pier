@@ -6,6 +6,7 @@ struct PierApp: App {
     @State private var sessions: PierSessions
     @State private var transfers: TransferManager
     @State private var uploads: UploadController
+    @State private var updater: UpdaterController
 
     init() {
         // 코어 로그를 os_log로 보내는 싱크는 한 번만 설치한다.
@@ -14,8 +15,11 @@ struct PierApp: App {
         LegacyMigration.runIfNeeded()
         _store = State(initialValue: ConnectionStore())
         _sessions = State(initialValue: PierSessions())
-        _transfers = State(initialValue: TransferManager())
+        // UpdaterController는 같은 TransferManager를 봐야 하므로 로컬로 먼저 만든다.
+        let transferManager = TransferManager()
+        _transfers = State(initialValue: transferManager)
         _uploads = State(initialValue: UploadController())
+        _updater = State(initialValue: UpdaterController(transfers: transferManager))
         // 새로 열리는 연결에 대기열 리스너를 달 수 있게 세션에 집계자를 연결한다.
         sessions.transfers = transfers
     }
@@ -27,13 +31,20 @@ struct PierApp: App {
                 .frame(minWidth: 720, minHeight: 460)
         }
         .defaultSize(width: 960, height: 620)
+        .commands {
+            // "Pier에 관하여" 아래에 수동 업데이트 확인을 둔다.
+            CommandGroup(after: .appInfo) {
+                Button("업데이트 확인…") { updater.checkForUpdates() }
+                    .disabled(!updater.canCheckForUpdates)
+            }
+        }
 
         Settings {
             SettingsView(store: store, sessions: sessions)
         }
 
         MenuBarExtra {
-            MenuBarContent(store: store, sessions: sessions, transfers: transfers)
+            MenuBarContent(store: store, sessions: sessions, transfers: transfers, updater: updater)
         } label: {
             // 전송이 진행 중이면 아이콘을 바꿔 상태를 알린다.
             Image(systemName: transfers.hasActiveJobs ? "arrow.up.arrow.down.circle.fill" : "externaldrive")

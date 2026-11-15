@@ -28,5 +28,17 @@
 	<string>Copyright © 2026 Pier contributors</string>
 	<key>NSPrincipalClass</key>
 	<string>NSApplication</string>
+	<key>SUFeedURL</key>
+	<string>https://github.com/kwakchangkyoung/Pier/releases/latest/download/appcast.xml</string>
+	<key>SUPublicEDKey</key>
+	<string>40AsbnqOaw1o9bo7IhluoRKFGPkut6sNi3X0SoH6WOQ=</string>
+	<key>SUEnableAutomaticChecks</key>
+	<true/>
+	<key>SUScheduledCheckInterval</key>
+	<integer>86400</integer>
+	<key>SUAutomaticallyUpdate</key>
+	<false/>
+	<key>SUVerifyUpdateBeforeExtraction</key>
+	<true/>
 </dict>
 </plist>

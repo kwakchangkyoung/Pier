@@ -1,0 +1,165 @@
+# 태그 푸시(v*.*.*) 또는 수동 실행으로 릴리스를 만든다.
+# 절차: 패키지 빌드(DMG+ZIP) → Sparkle 도구로 appcast 서명·생성 → GitHub Release에 자산 업로드.
+# 수동 실행(workflow_dispatch)은 기본적으로 dry_run이라 릴리스 대신 artifact만 올린다.
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "릴리스 버전 (v 없이, 예: 0.1.1 또는 0.1.1-test)"
+        required: true
+        type: string
+      dry_run:
+        description: "릴리스를 만들지 않고 산출물만 artifact로 업로드"
+        required: true
+        default: true
+        type: boolean
+
+# gh release create에 필요. 태그 푸시와 dry_run=false 수동 실행에서만 쓰인다.
+permissions:
+  contents: write
+
+jobs:
+  release:
+    # 현재 GitHub 공식 최신 안정 arm64 러너.
+    # 근거: actions/runner-images README에서 macos-latest가 macos-26(arm64)을 가리킨다.
+    runs-on: macos-26
+
+    steps:
+      - name: 저장소 체크아웃
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Xcode 선택 (최신 안정 버전)
+        run: |
+          ls -d /Applications/Xcode*.app 2>/dev/null || true
+          # 베타를 제외한 버전 디렉터리 중 가장 높은 것을 고른다. 없으면 기본 Xcode.app.
+          XCODE_APP="$(ls -d /Applications/Xcode_*.app 2>/dev/null | grep -vi beta | sort -V | tail -1)"
+          if [ -z "$XCODE_APP" ]; then
+              XCODE_APP="/Applications/Xcode.app"
+          fi
+          echo "선택: ${XCODE_APP}"
+          sudo xcode-select -s "${XCODE_APP}/Contents/Developer"
+          xcodebuild -version
+
+      - name: Rust 툴체인 설치
+        run: |
+          # rust-toolchain.toml이 없으므로 여기서 버전을 고정한다.
+          rustup toolchain install 1.99.1 --profile minimal --target aarch64-apple-darwin
+          rustup default 1.99.1
+          rustc --version
+          cargo --version
+
+      - name: cargo 캐시
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-1.99.1-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-1.99.1-
+
+      - name: XcodeGen 설치
+        run: |
+          brew install xcodegen
+          xcodegen --version
+
+      - name: 버전 결정
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+              VER="${GITHUB_REF_NAME#v}"
+          else
+              VER="${{ inputs.version }}"
+              VER="${VER#v}"
+          fi
+          if ! [[ "$VER" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$ ]]; then
+              echo "오류: 버전 형식이 올바르지 않습니다: ${VER}" >&2
+              exit 1
+          fi
+          echo "version=${VER}" >> "$GITHUB_OUTPUT"
+          echo "VERSION=${VER}" >> "$GITHUB_ENV"
+          echo "버전: ${VER}"
+
+      - name: 패키지 빌드 (코어 + 앱 + DMG/ZIP)
+        env:
+          PIER_VERSION: ${{ steps.version.outputs.version }}
+        run: ./scripts/package.sh
+
+      - name: Sparkle 도구 다운로드·SHA-256 검증
+        run: |
+          SPARKLE_VERSION="2.10.1"
+          EXPECTED_SHA="1a856d2a9edb8e628de88121d7be04cf0e2167f8641650b78fca00b14244cf27"
+          TARBALL="${RUNNER_TEMP}/Sparkle-${SPARKLE_VERSION}.tar.xz"
+          curl -fsSL -o "$TARBALL" \
+              "https://github.com/sparkle-project/Sparkle/releases/download/${SPARKLE_VERSION}/Sparkle-${SPARKLE_VERSION}.tar.xz"
+          echo "${EXPECTED_SHA}  ${TARBALL}" | shasum -a 256 -c -
+          mkdir -p "${RUNNER_TEMP}/sparkle"
+          tar -xJf "$TARBALL" -C "${RUNNER_TEMP}/sparkle"
+          echo "SPARKLE_BIN=${RUNNER_TEMP}/sparkle/bin" >> "$GITHUB_ENV"
+
+      - name: appcast.xml 생성 (EdDSA 서명)
+        env:
+          SPARKLE_ED_PRIVATE_KEY: ${{ secrets.SPARKLE_ED_PRIVATE_KEY }}
+        run: |
+          KEY_FILE="$(mktemp)"
+          trap 'rm -f "$KEY_FILE"' EXIT
+          # 비밀키를 파일로 쓸 때만 권한을 좁힌다. 사용 직후 삭제하고 로그에 출력하지 않는다.
+          (umask 077; printf '%s' "$SPARKLE_ED_PRIVATE_KEY" > "$KEY_FILE")
+          ./scripts/make-appcast.sh "dist/Pier-${VERSION}.zip" "$VERSION" "$KEY_FILE"
+
+          # 시크릿의 공개키가 앱 Info.plist의 SUPublicEDKey와 일치하는지 검증한다.
+          cat > "${RUNNER_TEMP}/derive_pub.swift" <<'SWIFT'
+          import CryptoKit
+          import Foundation
+          let seedB64 = try String(contentsOfFile: CommandLine.arguments[1], encoding: .utf8)
+              .trimmingCharacters(in: .whitespacesAndNewlines)
+          guard let seed = Data(base64Encoded: seedB64) else {
+              FileHandle.standardError.write("비밀키 base64 디코딩 실패\n".data(using: .utf8) ?? Data())
+              exit(1)
+          }
+          let pub = try Curve25519.Signing.PrivateKey(rawRepresentation: seed).publicKey
+          print(pub.rawRepresentation.base64EncodedString())
+          SWIFT
+          ACTUAL_PUB="$(xcrun swift "${RUNNER_TEMP}/derive_pub.swift" "$KEY_FILE" 2>/dev/null | tail -1)"
+          EXPECTED_PUB="$(/usr/libexec/PlistBuddy -c 'Print :SUPublicEDKey' \
+              "dist/dmg-root/Pier.app/Contents/Info.plist")"
+          rm -f "$KEY_FILE"
+          if [ "$ACTUAL_PUB" != "$EXPECTED_PUB" ]; then
+              echo "오류: SPARKLE_ED_PRIVATE_KEY의 공개키가 앱의 SUPublicEDKey와 다릅니다." >&2
+              exit 1
+          fi
+          echo "공개키 일치 확인"
+
+      - name: GitHub Release 생성
+        if: github.event_name == 'push' || inputs.dry_run == false
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          EXTRA_ARGS=()
+          # 태그 푸시가 아니면 현재 커밋에 태그를 새로 만든다.
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+              EXTRA_ARGS+=(--target "${{ github.sha }}")
+          fi
+          gh release create "v${VERSION}" \
+              "dist/Pier-${VERSION}.dmg" \
+              "dist/Pier-${VERSION}.zip" \
+              "dist/appcast.xml" \
+              --title "Pier ${VERSION}" \
+              --generate-notes \
+              "${EXTRA_ARGS[@]}"
+
+      - name: 산출물 업로드 (dry_run)
+        if: github.event_name == 'workflow_dispatch' && inputs.dry_run
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: pier-${{ steps.version.outputs.version }}-dist
+          path: |
+            dist/Pier-*.dmg
+            dist/Pier-*.zip
+            dist/appcast.xml

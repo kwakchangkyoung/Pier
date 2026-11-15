@@ -1,4 +1,10 @@
 name: Pier
+packages:
+  # 자동 업데이트 프레임워크. CI의 appcast 서명 도구와 같은 버전을 유지한다.
+  Sparkle:
+    url: https://github.com/sparkle-project/Sparkle
+    exactVersion: "2.10.1"
+
 options:
   bundleIdPrefix: com.gajago
   deploymentTarget:
@@ -36,6 +42,9 @@ targets:
       - sdk: SystemConfiguration.framework
       - sdk: Security.framework
       - sdk: CoreFoundation.framework
+      # 앱 타깃이므로 Sparkle.framework가 자동으로 임베드·재서명된다.
+      - package: Sparkle
+        product: Sparkle
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.gajago.pier

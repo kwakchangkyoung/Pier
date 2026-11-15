@@ -219,7 +219,7 @@ pub struct ConnectionConfig {
 
 ### 6.2 메뉴바 (`MenuBarExtra`)
 
-- 진행 중인 전송과 속도, 연결 목록에서 창 열기, 현재 폴더 새로고침, 설정 열기.
+- 진행 중인 전송과 속도, 연결 목록에서 창 열기, 현재 폴더 새로고침, 업데이트 확인, 설정 열기.
 
 ### 6.3 Finder와의 드래그 앤 드롭
 
@@ -292,9 +292,11 @@ pub struct ConnectionConfig {
   - 호환성 표와 검증 스크립트 사용법: [docs/COMPATIBILITY.md](COMPATIBILITY.md) (`./scripts/compat-test.sh`).
 - 성능 측정: 동일 조건에서 `aws s3 cp`, rclone과 처리량 비교 결과를 README에 기록.
 - 서명 없이 배포: Release 빌드를 ad-hoc 서명해 DMG(또는 zip)로 GitHub Releases에 배포한다. README에 "처음 실행 시 Gatekeeper 경고 → 시스템 설정 > 개인정보 보호 및 보안 > '확인 없이 열기'" 안내를 넣는다. 라이선스 파일(MIT/Apache-2.0 이중 라이선스 예정, 확정 필요).
-- 패키징 명령: `./scripts/package.sh` — 코어 release 빌드 → xcodegen → Release 빌드 → ad-hoc 서명 → `dist/Pier-<버전>.dmg` 생성.
+- 패키징 명령: `./scripts/package.sh` — 코어 release 빌드 → xcodegen → Release 빌드 → ad-hoc 서명 → `dist/Pier-<버전>.dmg` + `dist/Pier-<버전>.zip`(Sparkle 업데이트용) 생성. `PIER_VERSION` 환경변수가 있으면 앱 번들 버전을 그 값으로 덮어쓴다.
 - **완료 기준:** 다른 맥에서 README 안내대로 설치·실행되고, 네 서비스 모두 Phase 2~4 기능이 동작하거나 제약이 문서화되어 있다.
 
 ### 이후 후보
 
 OpenDAL 기반 다른 백엔드(OneDrive → Google Drive 순), 버전 목록·복원, 스토리지 클래스 변경, 연결된 모든 버킷 통합 검색, 클라우드 간 직접 복사, 대역폭 제한 스케줄, File Provider 기반 Finder 통합, Developer ID 서명·공증.
+
+자동 업데이트는 Sparkle(EdDSA 서명된 `appcast.xml`)로 처리하고, `v*.*.*` 태그 푸시 시 GitHub Actions가 DMG/ZIP/appcast를 만들어 릴리스에 올린다. 전송 중에는 설치 재시동을 미룬다. 자세한 절차는 [docs/RELEASING.md](RELEASING.md).
